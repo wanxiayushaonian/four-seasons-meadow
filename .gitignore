@@ -1,0 +1,8 @@
+/dist/
+/.dist-*/
+/.wrangler/
+/node_modules/
+/seasons-cloudflare.zip
+
+# Local comparison renders.
+/seasons/artifacts/

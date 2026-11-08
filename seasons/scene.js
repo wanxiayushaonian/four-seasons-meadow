@@ -1,4 +1,7 @@
 import * as THREE from './vendor/three.module.js';
+import { makeCatSkin } from './cat-skin.js';
+import { foxtailJumpAction, foxtailJumpHeight, foxtailJumpWindow, planFoxtailJumps } from './foxtail-jump.js';
+import { buildSummerFlight } from './summer-flight.js';
 
 // Four revolutions make a year. The geometry stays still; the seasons pass over it.
 const SETTINGS = {
@@ -6,8 +9,8 @@ const SETTINGS = {
   hubRadius: .96,
   blades: matchMedia('(max-width: 700px)').matches ? 84000 : 196000,
   flowers: 12500,
-  particles: 2200,
-  snowflakes: matchMedia('(max-width: 700px)').matches ? 1400 : 3200,
+  particles: 2640,
+  snowflakes: matchMedia('(max-width: 700px)').matches ? 1660 : 3800,
   grassHeight: 1.5,
   grassRecoverySeconds: 1.2,
   snowPrintSeconds: 14,
@@ -16,6 +19,7 @@ const SETTINGS = {
   seed: 713821,
 };
 const TAU = Math.PI * 2;
+const phaseRate=4/SETTINGS.yearSeconds;
 const stage = document.querySelector('.stage');
 const canvas = document.querySelector('#scene');
 const loading = document.querySelector('.loading');
@@ -27,6 +31,7 @@ const seasonNames = ['春生', '夏长', '秋收', '冬藏'];
 const seasonEnglish = ['SPRING', 'SUMMER', 'AUTUMN', 'WINTER'];
 const seasonButtons = [...document.querySelectorAll('[data-season]')];
 let phase = SETTINGS.initialPhase, time = 0, speed = 1;
+let needlePhaseOffset=phase;
 let paused = motionPreference.matches, ready = false, previousTime = 0;
 let lastSeason = -1, lastUiUpdate = 0;
 let randomState = SETTINGS.seed;
@@ -187,6 +192,10 @@ const uniforms = {
 };
 // A circular sector with a world-space transition on both edges.
 const SEASON_BLEND_WIDTH=.72;
+const SNOW_BUILD_TURNS=.23;
+const SNOW_SEAM_WIDTH=.32;
+const SNOW_DUST_DEPTH=.12;
+const SNOW_WRAP_TURNS=.006;
 const seasonGLSL = `
   const float TAU = 6.28318530718;
   vec4 seasonVector(float s) {
@@ -219,6 +228,7 @@ const seasonGLSL = `
 const windGLSL = `
   uniform float uGrassHeight;
   uniform sampler2D uWindMap;
+  uniform vec2 uNeedleDirection;
   float meadowHeight(vec2 p, vec4 season) {
     float foreground = smoothstep(1.05,2.45,p.y);
     float field = dot(season,vec4(1.12,1.40,1.30,.5));
@@ -232,6 +242,19 @@ const windGLSL = `
     float gust=smoothstep(.33,.69,.65*broad.b+.35*local.b);
     vec2 direction=normalize(vec2(.94,.22)+(broad.rg-.5)*1.16+(local.rg-.5)*.68);
     return vec3(direction*(.13+.80*gust),gust);
+  }
+  vec3 needleWake(vec2 p, vec3 wind) {
+    vec2 tangent=vec2(-uNeedleDirection.y,uNeedleDirection.x);
+    float along=dot(p,uNeedleDirection);
+    float behind=-dot(p,tangent);
+    float lengthOfWake=.30+.33*along;
+    if(along<=.96||behind<-.24||behind>lengthOfWake*1.20)return vec3(0.);
+    // Existing gusts stagger the arrival and recovery across the grass.
+    float lag=behind+(wind.z-.5)*.16;
+    float arrival=smoothstep(-.15,.075,lag);
+    float recovery=1.-smoothstep(.10,mix(.77,1.16,wind.z),lag/lengthOfWake);
+    float strength=arrival*recovery*smoothstep(.96,1.75,along)*(.68+.32*wind.z);
+    return vec3(tangent*2.10+wind.xy*.20,strength);
   }
 `;
 
@@ -264,18 +287,48 @@ const catShadowGLSL = `
   }
 `;
 
-const snowGLSL = `
-  float snowNoise(vec2 p) {
-    vec2 cell=floor(p), f=fract(p);
-    f=f*f*(3.-2.*f);
-    return mix(mix(hash(cell),hash(cell+vec2(1.,0.)),f.x),
-               mix(hash(cell+vec2(0.,1.)),hash(cell+vec2(1.,1.)),f.x),f.y);
+const snowAccumulationGLSL = `
+  float softenSnowWrap(float cover, float phase) {
+    float sweep=fract(phase);
+    float winter=step(3.,phase);
+    if(sweep<${SNOW_WRAP_TURNS})return mix(1.-winter,cover,smoothstep(0.,${SNOW_WRAP_TURNS},sweep));
+    if(sweep>1.-${SNOW_WRAP_TURNS})return mix(cover,winter,smoothstep(1.-${SNOW_WRAP_TURNS},1.,sweep));
+    return cover;
   }
+  float snowMaturity(float angle, float arc, float phase) {
+    // Count from the start of winter through the spring melt, across the year wrap.
+    float turn=fract(angle);
+    float age=(phase<1.?phase+1.:phase-3.)-turn;
+    float mature=smoothstep(0.,${SNOW_BUILD_TURNS},age);
+    float seam=${SNOW_SEAM_WIDTH}/arc;
+    float fromSeam=min(turn,1.-turn);
+    if(fromSeam<seam) {
+      float otherAge=age+(turn<.5?-1.:1.);
+      mature=mix(mature,smoothstep(0.,${SNOW_BUILD_TURNS},otherAge),.5*(1.-smoothstep(0.,seam,fromSeam)));
+    }
+    return mature;
+  }
+`;
+
+const snowGLSL = `
+  ${snowAccumulationGLSL}
+  // Value noise with analytic slopes for the small relief in the powder.
+  vec3 snowRelief(vec2 p) {
+    vec2 cell=floor(p), f=fract(p);
+    vec2 blend=f*f*(3.-2.*f);
+    float a=hash(cell), b=hash(cell+vec2(1.,0.));
+    float c=hash(cell+vec2(0.,1.)), d=hash(cell+vec2(1.,1.));
+    float value=mix(mix(a,b,blend.x),mix(c,d,blend.x),blend.y);
+    vec2 slope=vec2(mix(b-a,d-c,blend.y),mix(c-a,d-b,blend.x))*6.*f*(1.-f);
+    return vec3(value,slope);
+  }
+  float snowNoise(vec2 p) { return snowRelief(p).x; }
   float snowHeight(vec2 p) {
     float radius=length(p);
     float edge=smoothstep(.99,1.18,radius)*(1.-smoothstep(5.16,5.35,radius));
-    float drift=.072 + .046*snowNoise(p*1.65) + .023*snowNoise(p*4.2);
-    drift+=.022*pow(.5+.5*sin(p.x*.9+p.y*1.7),2.);
+    vec2 driftAxes=vec2(dot(p,vec2(.88,.48)),dot(p,vec2(-.48,.88)));
+    float bank=smoothstep(.16,.86,snowNoise(driftAxes*vec2(.72,1.65)));
+    float drift=.060+.076*bank+.024*snowNoise(p*4.1);
     return -.012+edge*drift;
   }
 `;
@@ -329,7 +382,7 @@ function makeDisc() {
       void main() {
         vec4 s = seasons(vPosition,uPhase);
         float r = length(vPosition);
-        vec3 color = mat4x3(vec3(.086,.14,.043),vec3(.068,.129,.028),vec3(.274,.186,.072),vec3(.024,.032,.034)) * s;
+        vec3 color = mat4x3(vec3(.086,.14,.043),vec3(.068,.129,.028),vec3(.274,.186,.072),vec3(.22,.21,.17)) * s;
         float grooves = .74 + .26 * smoothstep(-.8,.8,sin(r*173.));
         color *= mix(.85,grooves,s.w) * (.78 + .22*hash(floor(vPosition*165.)));
         gl_FragColor = vec4(color,1.);
@@ -375,58 +428,72 @@ function makeSnowCover() {
   geometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
   geometry.setIndex(indices);
   const material=new THREE.ShaderMaterial({
-    uniforms, side:THREE.DoubleSide,
+    uniforms, side:THREE.DoubleSide, alphaToCoverage:true,
     vertexShader:`
       uniform float uPhase;
-      varying vec3 vWorld; varying vec3 vNormal;
+      varying vec3 vWorld; varying vec3 vNormal; varying float vMaturity;
       ${seasonGLSL}
       ${snowGLSL}
       ${trampleGLSL}
       void main() {
         vec2 p=position.xz;
-        float cover=seasons(p,uPhase).w;
-        float amount=smoothstep(.02,.98,cover);
-        float surface=snowHeight(p)-.034*snowPrintAt(p);
-        vec3 world=vec3(p.x,mix(-.018,surface,amount),p.y);
+        float angle=atan(p.y,p.x)/TAU;
+        float arc=TAU*max(length(p),.96);
+        float cover=softenSnowWrap(seasonWeights(seasonCoverageAt(p,fract(uPhase),angle,arc),uPhase).w,uPhase);
+        vMaturity=snowMaturity(angle,arc,uPhase);
+        float thickness=smoothstep(.02,.98,cover)*mix(${SNOW_DUST_DEPTH},1.,vMaturity);
+        float surface=mix(-.018,snowHeight(p),thickness)-.034*snowPrintAt(p)*thickness;
+        vec3 world=vec3(p.x,surface,p.y);
         float dx=(snowHeight(p+vec2(.035,0.))-snowHeight(p-vec2(.035,0.)))/.07;
         float dz=(snowHeight(p+vec2(0.,.035))-snowHeight(p-vec2(0.,.035)))/.07;
-        vNormal=normalize(vec3(-dx,1.,-dz)); vWorld=world;
+        vNormal=normalize(vec3(-dx*thickness,1.,-dz*thickness)); vWorld=world;
         gl_Position=projectionMatrix*modelViewMatrix*vec4(world,1.);
       }`,
     fragmentShader:`
       uniform float uPhase;
-      varying vec3 vWorld; varying vec3 vNormal;
+      varying vec3 vWorld; varying vec3 vNormal; varying float vMaturity;
       ${seasonGLSL}
       ${snowGLSL}
       ${catShadowGLSL}
       ${trampleGLSL}
       void main() {
+        vec2 p=vWorld.xz;
+        float pixelSpan=max(length(dFdx(p)),length(dFdy(p)));
         // Re-evaluate the angular edge per pixel; interpolating the mask across
         // the ring would leave visible triangles along the seasonal boundary.
-        float cover=seasons(vWorld.xz,uPhase).w;
+        float cover=softenSnowWrap(seasons(p,uPhase).w,uPhase);
         if(cover<.11)discard;
-        vec2 p=vWorld.xz;
-        // The thinning blanket breaks into small patches, exposing the grass beneath.
-        if(cover<.85) {
-          float snowThreshold=.11+.58*snowNoise(p*4.1)+.16*hash(floor(p*80.));
-          if(cover<snowThreshold)discard;
+        // Small deposits coalesce in place before they become a continuous blanket.
+        float packed=cover*mix(.30,1.,vMaturity*vMaturity);
+        float opacity=1.;
+        if(packed<.92) {
+          float snowThreshold=.13+.58*snowNoise(p*3.8)+.16*hash(floor(p*56.));
+          opacity=smoothstep(snowThreshold-.045,snowThreshold+.050,packed);
+          if(opacity<.015)discard;
         }
-        float print=snowPrintAt(p);
+        float printStrength=mix(.35,1.,vMaturity);
+        float print=snowPrintAt(p)*printStrength;
         vec2 stepSize=vec2(.033,0.);
         float printDx=snowPrintAt(p+stepSize)-snowPrintAt(p-stepSize);
         float printDz=snowPrintAt(p+stepSize.yx)-snowPrintAt(p-stepSize.yx);
-        vec3 normal=normalize(vNormal+vec3(printDx,0.,printDz)*.68);
-        float light=clamp(dot(normal,normalize(vec3(-.5,1.,.45))),0.,1.);
-        float drift=snowNoise(p*1.65);
-        vec3 color=mix(vec3(.69,.77,.83),vec3(.96,.98,.98),light*.78+drift*.15);
+        float detail=1.-smoothstep(.030,.080,pixelSpan);
+        vec3 grain=snowRelief(p*13.);
+        vec3 normal=normalize(vNormal+vec3(printDx,0.,printDz)*(.68*printStrength)
+          -vec3(grain.y,0.,grain.z)*mix(.035,.080,vMaturity)*detail);
+        float light=clamp(dot(normal,normalize(vec3(-.61,.71,.45))),0.,1.);
+        float bank=snowNoise(p*1.45);
+        float softLight=clamp(.13+.91*light+.10*(bank-.5),0.,1.);
+        vec3 color=mix(vec3(.58,.70,.82),vec3(.96,.982,.99),softLight);
+        color*=.97+.11*(bank-.5)+.027*(grain.x-.5)*detail;
         color*=mix(vec3(1.),vec3(.58,.68,.76),smoothstep(.04,.85,print));
-        float grain=hash(floor(vWorld.xz*320.));
-        color+=(grain-.5)*.022+pow(grain,40.)*.07;
+        float fleck=hash(floor(p*64.));
+        color+=detail*vec3(.87,.95,1.)*smoothstep(.991,1.,fleck)*.038;
         float radius=length(vWorld.xz);
         color*=.87+.13*smoothstep(1.0,1.3,radius);
         color*=catShade(vWorld.xz,vec2(.9,1.5),9.,.20);
         color*=mix(.90,1.,smoothstep(.18,.80,cover));
-        gl_FragColor=vec4(color,1.);
+        color*=mix(.91,1.,vMaturity);
+        gl_FragColor=vec4(color,opacity);
       }`,
   });
   const blanket=new THREE.Mesh(geometry,material);
@@ -508,11 +575,12 @@ function makeGrass() {
   const material = new THREE.ShaderMaterial({
     uniforms, side: THREE.DoubleSide, alphaToCoverage:true,
     vertexShader: `
-      uniform float uTime; uniform float uPhase; uniform vec2 uNeedleDirection;
+      uniform float uTime; uniform float uPhase;
       attribute vec4 aRoot; attribute vec4 aTraits;
-      varying float vHeight; varying vec2 vShade; varying float vNoise; varying float vPressure; varying vec4 vSeason;
+      varying float vHeight; varying vec3 vShade; varying float vNoise; varying float vPressure; varying vec4 vSeason;
       varying float vAcross;
       ${seasonGLSL}
+      ${snowAccumulationGLSL}
       ${windGLSL}
       ${trampleGLSL}
       ${catShadowGLSL}
@@ -520,16 +588,20 @@ function makeGrass() {
         vec2 root=aRoot.xy;
         float coverage=seasonCoverageAt(root,fract(uPhase),aRoot.z,aRoot.w);
         vec4 s=seasonWeights(coverage,uPhase);
+        float exposed=s.w>0.?.56*(1.-snowMaturity(aRoot.z,aRoot.w,uPhase)):0.;
+        s.z+=s.w*exposed;
+        s.w*=1.-exposed;
         float t = position.y;
         float h = aTraits.x * meadowHeight(root,s);
         h *= 1. - s.w * (1.-(.43+.57*pow(aTraits.w,14.)));
         vec2 sideways = normalize(aTraits.yz);
         vec3 wind=meadowWind(root,uTime);
-        vec2 flow=wind.xy+vec2(-root.y,root.x)*.018*s.z;
+        vec3 wake=needleWake(root,wind);
+        vec2 flow=mix(wind.xy,wake.xy,wake.z)+vec2(-root.y,root.x)*.018*s.z;
         float flowLength=length(flow);
         vec2 direction=flow/max(flowLength,.001);
-        float bendAngle=clamp((.14+flowLength*1.24)*(.83+aTraits.w*.33),.08,1.45);
-        bendAngle*=1.-s.w*.83;
+        float bendAngle=clamp((.14+flowLength*1.24)*(.83+aTraits.w*.33),.08,1.45+.72*wake.z);
+        bendAngle*=1.-s.w*mix(.83,.50,wake.z);
         float theta=bendAngle*t;
         vec2 curl=vec2(-sideways.y,sideways.x)*(.13+.20*aTraits.w);
         curl+=sideways*(fract(aTraits.w*8.13)-.5)*.16;
@@ -553,15 +625,22 @@ function makeGrass() {
         float changeAt=.13+.74*fract(aTraits.w*11.57);
         float mature=smoothstep(changeAt-.12,changeAt+.12,coverage);
         vSeason=seasonWeights(mix(coverage,mature,.65),uPhase);
+        vSeason.z+=vSeason.w*exposed;
+        vSeason.w*=1.-exposed;
         vHeight=t; vNoise=aTraits.w; vPressure=pressure; vAcross=sign(position.x);
         vShade.x=(.82+.14*abs(dot(bladeNormal,normalize(vec3(-.5,.85,.4)))))*(.92+.13*wind.z)*shadow*(1.-pressure*.16);
         float along=dot(root,uNeedleDirection);
         float crossDistance=root.x*uNeedleDirection.y-root.y*uNeedleDirection.x;
         vShade.y=1.-.15*exp(-crossDistance*crossDistance*100.)*step(.9,along)*step(along,5.);
+        // Bent tips catch a little warm light in the wake, varying with their angle and the gusts.
+        vec3 sweepLight=vec3(-.91*uNeedleDirection.y,.414,.91*uNeedleDirection.x);
+        float sheen=.49+.51*abs(dot(bladeNormal,sweepLight));
+        vShade.z=smoothstep(.14,.81,wake.z)*smoothstep(-.025,.18,crossDistance)
+          *sheen*(.75+.25*wind.z)*(.67+.33*aTraits.w)*(1.-s.w);
         gl_Position = projectionMatrix*modelViewMatrix*vec4(world,1.);
       }`,
     fragmentShader: `
-      varying float vHeight; varying vec2 vShade; varying float vNoise; varying float vPressure; varying vec4 vSeason;
+      varying float vHeight; varying vec3 vShade; varying float vNoise; varying float vPressure; varying vec4 vSeason;
       varying float vAcross;
       void main() {
         vec3 root = mat4x3(vec3(.075,.148,.049),vec3(.077,.151,.058),vec3(.40,.274,.117),vec3(.55,.63,.66))*vSeason;
@@ -569,6 +648,7 @@ function makeGrass() {
         vec3 color = mix(root,tip,.16+.79*pow(vHeight,.62));
         color *= (.93+vNoise*.12) * vShade.x * .80;
         color += tip*.045*smoothstep(.52,.99,vHeight)*(1.-vPressure*.60);
+        color += vec3(.23,.122,.024)*vShade.z*smoothstep(.25,.94,vHeight);
         color*=vShade.y;
         color*=1.-vPressure*.30*(1.-vHeight*.25);
         float coverage=1.-.32*smoothstep(.58,1.,abs(vAcross));
@@ -604,18 +684,23 @@ function makeFlowers() {
         vec4 s=seasons(position.xz,uPhase);
         vec3 p=position;
         vec3 wind=meadowWind(position.xz,uTime);
-        float bendAngle=clamp(.14+length(wind.xy)*1.24,.08,1.45);
+        vec3 wake=needleWake(position.xz,wind);
+        vec2 flow=mix(wind.xy,wake.xy,wake.z);
+        float flowLength=length(flow);
+        float bendAngle=clamp(.14+flowLength*1.24,.08,1.45+.72*wake.z);
         float h=p.y*meadowHeight(position.xz,s);
         vec3 trample=trampleAt(position.xz);
         float pressure=clamp(trample.x*1.12,0.,.96);
-        vec2 direction=normalize(wind.xy);
+        vec2 direction=flow/max(flowLength,.001);
         vec2 bend=direction*h*(1.-cos(bendAngle))/bendAngle;
         vec2 laid=trample.yz*.60+direction*h*.16*pressure;
         p.xz+=mix(bend,laid,pressure);
         p.y=h*sin(bendAngle)/bendAngle*(1.-pressure*.87)+.008;
         vec4 view=modelViewMatrix*vec4(p,1.);
-        vAlpha=(s.x*.84+s.y*.06)*(.4+.6*aTraits.x);
+        float summerBloom=step(.74,aTraits.x);
+        vAlpha=(s.x*.84+s.y*.62*summerBloom)*(.4+.6*aTraits.x);
         vColor=mix(vec3(.86,.89,.78),vec3(.82,.89,.9),s.w);
+        vColor=mix(vColor,vec3(.94,.95,.92),s.y);
         gl_PointSize=(.75+aTraits.y*1.2)*uPointScale*17./-view.z;
         gl_Position=projectionMatrix*view;
       }`,
@@ -669,19 +754,18 @@ function makeFoxtail() {
 }
 
 const sphereGeometry = new THREE.SphereGeometry(1,20,14);
-const torsoProfile=new THREE.SplineCurve([
-  [0,-.368],[.086,-.341],[.137,-.275],[.148,-.185],[.120,-.052],
-  [.129,.085],[.143,.178],[.124,.249],[.080,.296],[0,.323],
-].map(([radius,x])=>new THREE.Vector2(radius,x)));
-const torsoGeometry=new THREE.LatheGeometry(torsoProfile.getPoints(32),24);
-torsoGeometry.rotateZ(-Math.PI/2);
-torsoGeometry.scale(1,1,.89);
-const torsoVertices=torsoGeometry.getAttribute('position');
-for(let i=0;i<torsoVertices.count;i++) {
-  const x=torsoVertices.getX(i);
-  torsoVertices.setY(i,torsoVertices.getY(i)+.044*THREE.MathUtils.smoothstep(x,-.22,.26));
-}
-torsoGeometry.computeVertexNormals();
+const catNoseOutline=new THREE.Shape();
+catNoseOutline.moveTo(-.018,.006);
+catNoseOutline.quadraticCurveTo(-.018,.011,0,.009);
+catNoseOutline.quadraticCurveTo(.018,.011,.018,.006);
+catNoseOutline.quadraticCurveTo(.016,0,.005,-.007);
+catNoseOutline.quadraticCurveTo(0,-.014,-.005,-.007);
+catNoseOutline.quadraticCurveTo(-.016,0,-.018,.006);
+const catNoseGeometry=new THREE.ExtrudeGeometry(catNoseOutline,{
+  depth:.005,bevelSize:.002,bevelThickness:.002,bevelSegments:2,curveSegments:6,
+});
+catNoseGeometry.rotateY(Math.PI/2);
+let catSkinGeometry;
 
 function ellipsoid(parent, material, position, scale) {
   const mesh=new THREE.Mesh(sphereGeometry,material);
@@ -732,24 +816,55 @@ function makeCatTail(parent,fur) {
   return bones;
 }
 
+const catLegY=.34;
+const foreleg={shoulderX:.18,upper:.128,forearm:.138,toeX:.012,toeY:-.040};
+const rearleg={upper:.19,pawX:.049,pawY:-.102,padHeight:.026};
+
 function makeCat(white) {
   const root=new THREE.Group(); root.scale.setScalar(.72); scene.add(root);
   const bodyPivot=new THREE.Group(); bodyPivot.position.y=.334; root.add(bodyPivot);
   const bodyGroup=new THREE.Group(); bodyGroup.position.y=-bodyPivot.position.y; bodyPivot.add(bodyGroup);
-  const fur=new THREE.MeshStandardMaterial({color:white?'#e4e2cb':'#0c1119',roughness:.91,metalness:0});
+  const fur=new THREE.MeshStandardMaterial({
+    color:white?'#e4e2cb':'#0c1119',roughness:.95,metalness:0,
+    emissive:white?'#9a907c':'#171d27',emissiveIntensity:white?.09:.12,
+  });
+  if(!white)fur.onBeforeCompile=shader=>{
+    shader.fragmentShader=shader.fragmentShader.replace('#include <emissivemap_fragment>',`
+      #include <emissivemap_fragment>
+      vec3 rimDirection=normalize((viewMatrix*vec4(.40,.67,-.63,0.)).xyz);
+      float edge=1.-clamp(dot(normal,normalize(vViewPosition)),0.,1.);
+      float rim=smoothstep(.17,.84,edge)*smoothstep(.06,.74,dot(normal,rimDirection));
+      totalEmissiveRadiance+=vec3(.016,.032,.055)*rim;
+    `);
+  };
   const inner=new THREE.MeshStandardMaterial({color:white?'#bd9e94':'#46404b',roughness:1});
-  const muzzle=new THREE.MeshStandardMaterial({color:white?'#ece7d7':'#161d27',roughness:.94});
-  const eyeMat=new THREE.MeshStandardMaterial({color:white?'#7b8050':'#b6bd81',emissive:'#5d6345',emissiveIntensity:.16,roughness:.45});
+  const eyeMat=new THREE.MeshStandardMaterial({color:white?'#989954':'#b6bd81',emissive:'#5d6345',emissiveIntensity:.16,roughness:.45});
   const pupilMat=new THREE.MeshStandardMaterial({color:'#090c10',roughness:.55});
-  const body=new THREE.Mesh(torsoGeometry,fur);
-  body.position.y=.334; bodyGroup.add(body);
-  const neck=ellipsoid(bodyGroup,fur,[.225,.411,0],[.132,.108,.103]);
-  neck.rotation.z=.59;
-  const head=new THREE.Group(); head.position.set(.295,.48,0); bodyGroup.add(head);
-  ellipsoid(head,fur,[0,0,0],[.134,.118,.112]);
-  ellipsoid(head,muzzle,[.093,-.061,0],[.057,.038,.063]);
+  const volumes=[];
+  const volume=(bone,center,radii,tilt)=>volumes.push({bone,center,radii,tilt});
+  const body=new THREE.Bone(); body.position.y=.334; bodyGroup.add(body);
+  volume(body,[-.221,.004,0],[.156,.140,.122]);
+  volume(body,[-.027,.013,0],[.247,.121,.112]);
+  volume(body,[.159,.036,0],[.168,.134,.116]);
+  volume(body,[.223,.071,0],[.127,.096,.097],.59);
+  const head=new THREE.Bone(); head.position.set(.295,.48,0); bodyGroup.add(head);
+  volume(head,[-.012,.012,0],[.115,.117,.124]);
+  volume(head,[-.070,-.052,0],[.101,.087,.091],.54);
+  volume(head,[.034,-.039,0],[.078,.068,.115]);
+  for(const side of [-1,1])volume(head,[.084,-.044,side*.036],[.040,.036,.049]);
+  volume(head,[.058,-.086,0],[.048,.030,.063]);
   const noseMaterial=new THREE.MeshStandardMaterial({color:white?'#9f7c74':'#202431',roughness:.8});
-  ellipsoid(head,noseMaterial,[.156,-.025,0],[.014,.012,.020]);
+  const nose=new THREE.Mesh(catNoseGeometry,noseMaterial);
+  nose.position.set(.130,-.031,0); head.add(nose);
+  const mouthGeometry=new THREE.BufferGeometry();
+  mouthGeometry.setAttribute('position',new THREE.Float32BufferAttribute([
+    .135,-.042,0,.134,-.060,0,
+    .134,-.060,0,.131,-.066,-.019,.131,-.066,-.019,.128,-.063,-.042,
+    .134,-.060,0,.131,-.066,.019,.131,-.066,.019,.128,-.063,.042,
+  ],3));
+  head.add(new THREE.LineSegments(mouthGeometry,new THREE.LineBasicMaterial({
+    color:white?'#61574e':'#090b10',transparent:true,opacity:.60,depthWrite:false,
+  })));
   const ears=[];
   for(const side of [-1,1]) {
     const ear=new THREE.Group();
@@ -759,30 +874,46 @@ function makeCat(white) {
     const inset=new THREE.Mesh(new THREE.ConeGeometry(.037,.100,3),inner);
     inset.position.set(.023,.054,0); inset.rotation.z=-.13; ear.add(inset);
     ears.push({joint:ear,side});
-    ellipsoid(head,muzzle,[.105,-.038,side*.033],[.053,.041,.049]);
-    ellipsoid(head,eyeMat,[.098,.021,side*.078],[.015,.014,.009]);
-    ellipsoid(head,pupilMat,[.107,.022,side*.084],[.007,.010,.006]);
+    const eye=new THREE.Group();
+    eye.position.set(.082,.031,side*.073); eye.rotation.y=-side*.49; head.add(eye);
+    ellipsoid(eye,pupilMat,[0,0,0],[.008,.021,.023]);
+    ellipsoid(eye,eyeMat,[.005,0,0],[.006,.017,.020]);
+    ellipsoid(eye,pupilMat,[.011,0,0],[.0028,.013,.0045]);
   }
   const legs=[];
-  for(const x of [-.205,.18])for(const side of [-1,1]) {
-    const pivot=new THREE.Group(); pivot.position.set(x,.34,side*.084); bodyGroup.add(pivot);
+  for(const x of [-.205,foreleg.shoulderX])for(const side of [-1,1]) {
+    const pivot=new THREE.Bone(); pivot.position.set(x,catLegY,side*.084); bodyGroup.add(pivot);
     const front=x>0;
-    if(front)ellipsoid(pivot,fur,[0,-.10,0],[.038,.125,.036]);
-    else ellipsoid(pivot,fur,[-.012,-.065,0],[.061,.138,.051]);
-    const ankle=new THREE.Group(); ankle.position.y=-.19; pivot.add(ankle);
-    ellipsoid(ankle,fur,[.018,-.048,0],[.029,.071,.029]);
-    const paw=ellipsoid(ankle,fur,[.049,-.102,0],[.050,.026,.037]);
-    legs.push({pivot,ankle,paw,front,side,sole:new THREE.Vector3(),snowContact:false});
+    const lower=new THREE.Bone(); lower.position.y=-(front?foreleg.upper:rearleg.upper); pivot.add(lower);
+    let wrist,paw;
+    if(front) {
+      volume(pivot,[.003,-.053,0],[.049,.092,.042]);
+      volume(lower,[0,-.061,0],[.034,.095,.031]);
+      wrist=new THREE.Bone(); wrist.position.y=-foreleg.forearm; lower.add(wrist);
+      volume(wrist,[.006,-.012,0],[.026,.038,.027]);
+      paw=ellipsoid(wrist,fur,[foreleg.toeX,foreleg.toeY,0],[.037,.022,.031]);
+    } else {
+      volume(pivot,[-.004,-.063,0],[.073,.141,.057]);
+      volume(lower,[.019,-.052,0],[.034,.078,.031],.33);
+      paw=ellipsoid(lower,fur,[rearleg.pawX,rearleg.pawY,0],[.050,rearleg.padHeight,.037]);
+    }
+    paw.visible=false;
+    volume(paw,[0,0,0],[1,1,1]);
+    legs.push({pivot,lower,wrist,paw,front,side,sole:new THREE.Vector3(),snowContact:false});
   }
+  const neutral=catHopSpline.evaluate(0);
+  for(const leg of legs)poseHopLeg(leg,neutral,0,false);
+  const skin=makeCatSkin(bodyGroup,volumes,fur,catSkinGeometry);
+  catSkinGeometry=skin.geometry;
   const tailBones=makeCatTail(bodyGroup,fur);
   const whiskers=[];
   for(const side of [-1,1])for(let k=0;k<3;k++) {
-    whiskers.push(.12,-.04,side*.065,.22-k*.025,-.035-k*.012,side*(.15+k*.01));
+    whiskers.push(.113,-.045-k*.006,side*(.060+k*.004),.147-k*.027,-.029-k*.027,side*(.154+k*.012));
   }
   const whiskerGeometry=new THREE.BufferGeometry();
   whiskerGeometry.setAttribute('position',new THREE.Float32BufferAttribute(whiskers,3));
   head.add(new THREE.LineSegments(whiskerGeometry,new THREE.LineBasicMaterial({color:white?'#c9c8b6':'#71808d',transparent:true,opacity:.45})));
-  const cat={root,bodyPivot,body,head,ears,tailBones,legs};
+  const cat={root,bodyPivot,body,head,ears,tailBones,legs,skin};
   cat.takeoffSupport=hopSupportAt(cat,CAT_HOP.launch);
   cat.landingSupport=hopSupportAt(cat,CAT_HOP.land);
   return cat;
@@ -793,7 +924,8 @@ const CAT_HOP = {
   levelStart:.45, levelEnd:.52,
   land:.685, absorb:.77, hindDown:.875,
 };
-const CAT_CYCLE_SECONDS=4.4;
+const CAT_CYCLE_SECONDS=14;
+const CAT_REST={prepare:.85,lower:.88,rise:.91,pitch:.74,floor:.082};
 const catLandings = Array.from({length:8},(_,i)=>{
   const angle=i*TAU/8-Math.PI*.75;
   return {x:Math.cos(angle)*1.72,z:2.99+Math.sin(angle)*.70};
@@ -802,33 +934,33 @@ const catLandings = Array.from({length:8},(_,i)=>{
 // A beat either holds its position or travels to a fraction of the next waypoint.
 const catRoutines=[
   [
-    {kind:'peek',seconds:.56},
+    {kind:'peek',seconds:.72},
     {kind:'jump',seconds:1.80,to:1},
-    {kind:'scan',seconds:.62},
+    {kind:'scan',seconds:.78},
   ],
   [
-    {kind:'walk',seconds:.74,to:.43},
-    {kind:'sniff',seconds:.86},
-    {kind:'walk',seconds:.90,to:1},
-    {kind:'peek',seconds:.54},
+    {kind:'walk',seconds:.91,to:.43},
+    {kind:'sniff',seconds:.93},
+    {kind:'walk',seconds:1.10,to:1},
+    {kind:'peek',seconds:.72},
   ],
   [
-    {kind:'stalk',seconds:.85,to:.32},
+    {kind:'stalk',seconds:1.02,to:.32},
     {kind:'pounce',seconds:1.54,to:1},
-    {kind:'sniff',seconds:.73},
+    {kind:'sniff',seconds:.89},
   ],
   [
-    {kind:'scan',seconds:.64},
+    {kind:'scan',seconds:.78},
     {kind:'pounce',seconds:1.50,to:.59},
-    {kind:'peek',seconds:.52},
-    {kind:'walk',seconds:.83,to:1},
+    {kind:'peek',seconds:.68},
+    {kind:'walk',seconds:1.00,to:1},
   ],
 ].map(beats=>{
   let seconds=0,position=0,moveEnd=0;
-  const segments=beats.map(({kind,seconds:duration,to=position})=>{
+  const segments=beats.map(({kind,seconds:duration,to=position},index)=>{
     const beat={kind,start:seconds,end:seconds+duration,from:position,to};
-    seconds=beat.end;
-    if(to>position)moveEnd=seconds;
+    seconds=beat.end+(index<beats.length-1?.42:0);
+    if(to>position)moveEnd=beat.end;
     position=to;
     return beat;
   });
@@ -842,8 +974,9 @@ const catHopPoses = [
   {at:CAT_HOP.crouch,front:[1.04,-1.91],hind:[-.85,1.13],stretch:.91,tail:.15},
   {at:CAT_HOP.launch,front:[.74,-1.42],hind:[-1.19,.19],stretch:1.10,tail:-.14},
   {at:CAT_HOP.climbEnd,front:[.90,-1.39],hind:[-1.04,.46],stretch:1.13,tail:-.20},
-  {at:.475,front:[.93,-1.42],hind:[-.72,1.37],stretch:1.10,tail:-.03},
-  {at:.60,front:[1.03,-.68],hind:[-.66,1.33],stretch:1.11,tail:.12},
+  {at:CAT_HOP.levelStart,front:[1.32,-.36],hind:[-1.03,.25],stretch:1.16,tail:-.12},
+  {at:CAT_HOP.levelEnd,front:[1.36,-.40],hind:[-1.05,.27],stretch:1.17,tail:-.13},
+  {at:.60,front:[1.27,-.42],hind:[-.82,.69],stretch:1.12,tail:.06},
   {at:CAT_HOP.land,front:[.97,-.40],hind:[-.54,1.21],stretch:1.06,tail:.18},
   {at:CAT_HOP.absorb,front:[1.42,-1.65],hind:[-.62,1.13],stretch:1.01,tail:.21},
   {at:.825,front:[1.12,-1.91],hind:[-.52,.69],stretch:.94,tail:.16},
@@ -864,11 +997,49 @@ function catHopPitch(progress) {
   return .72*climb-.68*dive;
 }
 
-function poseHopLeg(leg,pose,air,pouncing) {
+const rearPawAngle=Math.atan2(rearleg.pawX,-rearleg.pawY);
+
+function authoredForePaw(shoulder,bend) {
+  // Keep the paw targets authored for the original two-segment rig.
+  const pitch=shoulder+bend;
+  const cos=Math.cos(pitch),sin=Math.sin(pitch);
+  return {
+    x:rearleg.upper*Math.sin(shoulder)+rearleg.pawX*cos-rearleg.pawY*sin,
+    down:rearleg.upper*Math.cos(shoulder)-rearleg.pawX*sin-rearleg.pawY*cos,
+    pitch,
+  };
+}
+
+const foreIdlePaw=authoredForePaw(...catIdlePose.front);
+
+function poseForeleg(leg,x,down,wristPitch,toePitch) {
+  const {upper,forearm,toeX,toeY}=foreleg;
+  const cos=Math.cos(wristPitch),sin=Math.sin(wristPitch);
+  const wristX=x-toeX*cos+toeY*sin;
+  const wristDown=down+toeX*sin+toeY*cos;
+  const elbowCos=(wristX*wristX+wristDown*wristDown-upper*upper-forearm*forearm)/(2*upper*forearm);
+  const elbow=Math.acos(THREE.MathUtils.clamp(elbowCos,-1,1));
+  const shoulder=Math.atan2(wristX,wristDown)-Math.atan2(forearm*Math.sin(elbow),upper+forearm*Math.cos(elbow));
+  leg.pivot.rotation.z=shoulder;
+  leg.lower.rotation.z=elbow;
+  leg.wrist.rotation.z=wristPitch-shoulder-elbow;
+  leg.paw.rotation.z=toePitch-wristPitch;
+}
+
+function poseHopLeg(leg,pose,air,pouncing,reach=0,sniff=0) {
+  const {lerp}=THREE.MathUtils;
   const joint=leg.front?0:2;
-  const reach=leg.front?.13:.095;
-  leg.pivot.rotation.z=pose[joint]+leg.side*reach*air+(pouncing?(leg.front?.18:-.08)*air:0);
-  leg.ankle.rotation.z=pose[joint+1]-leg.side*.11*air;
+  const offset=leg.front?.065:.095;
+  const shoulder=pose[joint]+leg.side*offset*air+(pouncing?(leg.front?.055:-.08)*air:0);
+  const bend=pose[joint+1]-leg.side*(leg.front?.06:.11)*air;
+  if(leg.front) {
+    const paw=authoredForePaw(shoulder+.22*sniff,bend-.36*sniff);
+    poseForeleg(leg,paw.x,paw.down,lerp(paw.pitch+rearPawAngle,1.05,reach),lerp(paw.pitch,-.12,reach));
+  } else {
+    leg.pivot.rotation.z=shoulder;
+    leg.lower.rotation.z=bend;
+    leg.paw.rotation.z=reach*(-1.22-shoulder-bend);
+  }
 }
 
 function measurePawSupport(cat) {
@@ -931,47 +1102,106 @@ function snowCoverAt(x,z) {
   const distance=(.5*sweep-offset)*arc;
   const feather=Math.min(SEASON_BLEND_WIDTH,arc*.35*Math.min(sweep,1-sweep));
   const contour=.34*Math.sin(x*1.5+z*1.9+.3)+.21*Math.sin(z*4.1-x*2.7-1);
-  const covered=THREE.MathUtils.smoothstep(distance+feather*contour,-feather,feather);
-  return current===3?covered:1-covered;
+  const {smoothstep,lerp}=THREE.MathUtils;
+  const covered=smoothstep(distance+feather*contour,-feather,feather);
+  const winter=current===3?1:0;
+  const cover=winter?covered:1-covered;
+  if(sweep<SNOW_WRAP_TURNS)return lerp(1-winter,cover,smoothstep(sweep,0,SNOW_WRAP_TURNS));
+  if(sweep>1-SNOW_WRAP_TURNS)return lerp(cover,winter,smoothstep(sweep,1-SNOW_WRAP_TURNS,1));
+  return cover;
 }
 
-const walkUpperLeg=.19;
-const walkLowerLeg=Math.hypot(.049,.102);
-const walkPawAngle=Math.atan2(.049,.102);
+function snowDepthAt(x,z,cover) {
+  if(cover<=.02)return 0;
+  const {smoothstep,lerp}=THREE.MathUtils;
+  // Match the accumulation curve in the snow mesh for paw height.
+  const turn=fract(Math.atan2(z,x)/TAU);
+  const age=(phase<1?phase+1:phase-3)-turn;
+  let mature=smoothstep(age,0,SNOW_BUILD_TURNS);
+  const seam=SNOW_SEAM_WIDTH/(TAU*Math.max(Math.hypot(x,z),.96));
+  const fromSeam=Math.min(turn,1-turn);
+  if(fromSeam<seam) {
+    const otherAge=age+(turn<.5?-1:1);
+    mature=lerp(mature,smoothstep(otherAge,0,SNOW_BUILD_TURNS),.5*(1-smoothstep(fromSeam,0,seam)));
+  }
+  return smoothstep(cover,.02,.98)*lerp(SNOW_DUST_DEPTH,1,mature);
+}
 
-function poseWalkingLeg(leg,step,stride,weight,crouch) {
+const rearLowerLeg=Math.hypot(rearleg.pawX,rearleg.pawY);
+const walkTailAngles=[-.98,-.11,.24,.10];
+const sitTailAngles=[[1.28,.28],[.42,-.24],[.36,-.14],[.22,.06]];
+
+function poseSittingLeg(leg,bodyPivot,sitting) {
+  const {lerp}=THREE.MathUtils;
+  if(!leg.front) {
+    // Fold the rear legs under the haunches before lowering the pelvis fully.
+    const fold=sitting*(2-sitting);
+    leg.pivot.rotation.z=lerp(catIdlePose.hind[0],.745,fold);
+    leg.lower.rotation.z=lerp(catIdlePose.hind[1],-2.768,fold);
+    leg.paw.rotation.z=1.283*sitting;
+    return;
+  }
+  const pitch=bodyPivot.rotation.z;
+  const targetX=lerp(foreleg.shoulderX+foreIdlePaw.x,.191,sitting);
+  const targetY=lerp(catLegY-foreIdlePaw.down,CAT_REST.floor+leg.paw.scale.y,sitting)-bodyPivot.position.y;
+  const cos=Math.cos(pitch),sin=Math.sin(pitch);
+  const x=cos*targetX+sin*targetY-leg.pivot.position.x;
+  const down=leg.pivot.position.y-bodyPivot.position.y+sin*targetX-cos*targetY;
+  poseForeleg(leg,x,down,lerp(foreIdlePaw.pitch+rearPawAngle,.22-pitch,sitting),lerp(foreIdlePaw.pitch,-pitch,sitting));
+}
+
+function poseWalkingLeg(leg,bodyPivot,step,stride,weight,down,swingHeight) {
   const {clamp,lerp,smoothstep}=THREE.MathUtils;
-  const stepPhase=fract(step+(leg.front?0:.24)+(leg.side===1?.5:0));
-  const stance=.62;
+  const stepPhase=fract(step+(leg.front?0:.25)+(leg.side===1?.5:0));
+  const stance=.64;
   const swing=clamp((stepPhase-stance)/(1-stance),0,1);
-  // During stance the local paw target offsets the body's forward travel.
-  const offset=stepPhase<stance?stance*.5-stepPhase:stance*(smoothstep(swing,0,1)-.5);
-  const x=.017+stride*offset;
-  const down=.272-.044*crouch-.088*Math.sin(Math.PI*swing);
-  const kneeCos=(x*x+down*down-walkUpperLeg**2-walkLowerLeg**2)/(2*walkUpperLeg*walkLowerLeg);
-  const knee=(leg.front?-1:1)*Math.acos(clamp(kneeCos,-1,1));
-  const hip=Math.atan2(x,down)-Math.atan2(walkLowerLeg*Math.sin(knee),walkUpperLeg+walkLowerLeg*Math.cos(knee));
-  const idle=leg.front?catIdlePose.front:catIdlePose.hind;
+  const lift=Math.sin(Math.PI*swing)**2;
+  // The stance target stays put as the torso moves. During swing it eases to the next print.
+  const offset=stance*.5-stepPhase+smoothstep(swing,0,1);
+  const joint=leg.pivot.position;
+  const targetX=joint.x+(leg.front?.026:-.011)+stride*offset;
+  const targetY=joint.y-down+swingHeight*lift-bodyPivot.position.y+leg.paw.scale.y-rearleg.padHeight;
+  const pitch=bodyPivot.rotation.z;
+  const cos=Math.cos(pitch),sin=Math.sin(pitch);
+  const x=cos*targetX+sin*targetY-joint.x;
+  const y=joint.y-bodyPivot.position.y+sin*targetX-cos*targetY;
+  if(leg.front) {
+    const wristPitch=.16+.85*(Math.atan2(x,y)+pitch)-.96*lift;
+    const toePitch=lerp(-.85,.25,swing)*lift;
+    poseForeleg(leg,lerp(foreIdlePaw.x,x,weight),lerp(foreIdlePaw.down,y,weight),
+      lerp(foreIdlePaw.pitch+rearPawAngle,wristPitch-pitch,weight),lerp(foreIdlePaw.pitch,toePitch-pitch,weight));
+    return;
+  }
+  const kneeCos=(x*x+y*y-rearleg.upper**2-rearLowerLeg**2)/(2*rearleg.upper*rearLowerLeg);
+  const knee=Math.acos(clamp(kneeCos,-1,1));
+  const hip=Math.atan2(x,y)-Math.atan2(rearLowerLeg*Math.sin(knee),rearleg.upper+rearLowerLeg*Math.cos(knee));
+  const idle=catIdlePose.hind;
   leg.pivot.rotation.z=lerp(idle[0],hip,weight);
-  leg.ankle.rotation.z=lerp(idle[1],knee-walkPawAngle,weight);
+  leg.lower.rotation.z=lerp(idle[1],knee-rearPawAngle,weight);
+  const toePitch=lerp(-.55,.32,swing)*lift;
+  leg.paw.rotation.z=weight*(toePitch-pitch-leg.pivot.rotation.z-leg.lower.rotation.z);
 }
 
-function animateCat(cat,index,atTime) {
+function catRoutineWait(cycle,index) { return .32+1.32*index+.76*catNoise(cycle,index); }
+
+function catMotionAt(index,atTime) {
   const {lerp,clamp,smoothstep}=THREE.MathUtils;
+  atTime=Math.max(0,atTime);
   const cycle=Math.floor(atTime/CAT_CYCLE_SECONDS);
   const point=(cycle+index*2)%catLandings.length;
   const localTime=atTime-cycle*CAT_CYCLE_SECONDS;
   const routine=catRoutineAt(cycle,index);
-  const wait=(CAT_CYCLE_SECONDS-routine.seconds)*(.22+index*.34+.30*catNoise(cycle,index));
+  const wait=catRoutineWait(cycle,index);
   const elapsed=localTime-wait;
+  const restStart=wait+routine.seconds+CAT_REST.prepare;
+  const riseStart=CAT_CYCLE_SECONDS-1.10-.65*catNoise(cycle,index,5)-.38*(1-index);
+  const sitting=smoothstep(localTime,restStart,restStart+CAT_REST.lower)*(1-smoothstep(localTime,riseStart,riseStart+CAT_REST.rise));
   const beat=routine.segments.find(segment=>elapsed<segment.end)??routine.segments.at(-1);
   const progress=clamp((elapsed-beat.start)/(beat.end-beat.start),0,1);
-  const stalking=beat.kind==='stalk';
-  const walking=beat.kind==='walk'||stalking;
-  const pouncing=beat.kind==='pounce';
-  const hopping=beat.kind==='jump'||pouncing;
+  const walking=beat.kind==='walk'||beat.kind==='stalk';
+  const hopping=beat.kind==='jump'||beat.kind==='pounce';
   const flight=hopping?clamp((progress-CAT_HOP.launch)/(CAT_HOP.land-CAT_HOP.launch),0,1):0;
-  const advance=walking?smoothstep(progress,.16,.87):flight;
+  const advance=walking?smoothstep(progress,.12,.9):flight;
   const travel=lerp(beat.from,beat.to,advance);
   const from=catLandings[point];
   const to=catLandings[(point+1)%catLandings.length];
@@ -979,56 +1209,205 @@ function animateCat(cat,index,atTime) {
   const x=lerp(from.x,to.x,travel), z=lerp(from.z,to.z,travel);
   const dx=to.x-from.x, dz=to.z-from.z;
   const distance=Math.hypot(dx,dz)*(beat.to-beat.from);
-  const hopHeight=(pouncing?.39:.67)+.09*distance;
-  cat.flight=flight;
-  cat.airHeight=4*hopHeight*flight*(1-flight);
   const heading=-Math.atan2(dz,dx);
   const nextHeading=-Math.atan2(next.z-to.z,next.x-to.x);
   const turn=Math.atan2(Math.sin(nextHeading-heading),Math.cos(nextHeading-heading));
-  cat.root.rotation.y=heading+turn*smoothstep(localTime,wait+routine.moveEnd,CAT_CYCLE_SECONDS-.035);
+  const hopGaze=hopping&&beat.to===1?turn*.31*smoothstep(progress,.47,.70)*(1-smoothstep(progress,.79,1)):0;
+  return {kind:beat.kind,progress,sitting,x,z,distance,flight,hopGaze,turn,
+    heading:heading+turn*smoothstep(localTime,wait+routine.moveEnd,restStart)};
+}
+
+function nextCatTravel(index,after) {
+  const first=Math.floor(Math.max(0,after)/CAT_CYCLE_SECONDS);
+  for(let cycle=first;cycle<=first+1;cycle++) {
+    const startOfRoutine=cycle*CAT_CYCLE_SECONDS+catRoutineWait(cycle,index);
+    for(const beat of catRoutineAt(cycle,index).segments) {
+      const start=startOfRoutine+beat.start;
+      if(start<after||beat.from===beat.to)continue;
+      const end=startOfRoutine+beat.end;
+      return {kind:beat.kind,start,end,target:catMotionAt(index,end)};
+    }
+  }
+  return null;
+}
+
+const foxtailJumpPlans=[new Map(),new Map()];
+const catGlancePlans=new Map();
+const CAT_GLANCE_BLOCK=CAT_CYCLE_SECONDS*2;
+const CAT_GLANCE_SECONDS=2.15;
+const CAT_GLANCE_OPEN=5.8;
+const CAT_GLANCE_CLOSE=CAT_GLANCE_BLOCK-1.55;
+const needleAngleAt=atTime=>fract(needlePhaseOffset+atTime*phaseRate)*TAU;
+
+function resetFoxtailPlans() {
+  needlePhaseOffset=phase-time*phaseRate;
+  for(const plans of foxtailJumpPlans)plans.clear();
+  catGlancePlans.clear();
+}
+
+function foxtailMotionAt(index,atTime) {
+  const cache=foxtailJumpPlans[index];
+  // A maneuver can begin in one cycle and finish in the next.
+  const first=Math.floor((atTime-foxtailJumpWindow.after)/CAT_CYCLE_SECONDS);
+  const last=Math.floor((atTime+foxtailJumpWindow.before)/CAT_CYCLE_SECONDS);
+  for(let cycle=first;cycle<=last;cycle++) {
+    if(!cache.has(cycle)) {
+      const start=cycle*CAT_CYCLE_SECONDS;
+      const plans=planFoxtailJumps(t=>catMotionAt(index,t),t=>nextCatTravel(index,t),needleAngleAt,
+        start,start+CAT_CYCLE_SECONDS,CAT_HOP,SETTINGS.radius);
+      if(cache.size>=5)cache.delete(cache.keys().next().value);
+      cache.set(cycle,plans);
+    }
+    const plan=cache.get(cycle).find(item=>atTime>=item.start&&atTime<item.end);
+    if(plan)return foxtailJumpAction(plan,atTime,CAT_HOP);
+  }
+  return null;
+}
+
+function catLookAngle(from,to,heading) {
+  const relative=-Math.atan2(to.z-from.z,to.x-from.x)-heading;
+  return Math.atan2(Math.sin(relative),Math.cos(relative));
+}
+
+function planCatGlance(block) {
+  const start=block*CAT_GLANCE_BLOCK;
+  let settledAt=null,alignedAt=null,overShoulder=null;
+  for(let t=start+CAT_GLANCE_OPEN;t<start+CAT_GLANCE_CLOSE;t+=.22) {
+    const black=foxtailMotionAt(0,t)??catMotionAt(0,t);
+    const white=foxtailMotionAt(1,t)??catMotionAt(1,t);
+    const distance=Math.hypot(white.x-black.x,white.z-black.z);
+    const blackAngle=Math.abs(catLookAngle(black,white,black.heading));
+    const whiteAngle=Math.abs(catLookAngle(white,black,white.heading));
+    const nearby=distance>.73&&distance<2.10;
+    const fartherAngle=Math.max(blackAngle,whiteAngle);
+    if(black.sitting<.995||white.sitting<.995||!nearby||Math.min(blackAngle,whiteAngle)>=1.20||fartherAngle>=2.39) {
+      settledAt=alignedAt=null;
+      continue;
+    }
+    const first=blackAngle<whiteAngle?0:1;
+    settledAt??=t;
+    if(!overShoulder&&t-settledAt>=CAT_GLANCE_SECONDS+.12)overShoulder={start:settledAt+.07,first};
+    if(fartherAngle>=1.92) {
+      alignedAt=null;
+      continue;
+    }
+    alignedAt??=t;
+    if(t-alignedAt>=CAT_GLANCE_SECONDS+.12)return {start:alignedAt+.07,first};
+  }
+  return overShoulder;
+}
+
+const glanceAxis=new THREE.Vector3(0,1,0);
+const glanceHead=new THREE.Quaternion(), glanceBody=new THREE.Quaternion();
+
+function applyCatGlance(atTime) {
+  const block=Math.floor(atTime/CAT_GLANCE_BLOCK);
+  const local=atTime-block*CAT_GLANCE_BLOCK;
+  if(local<CAT_GLANCE_OPEN||local>=CAT_GLANCE_CLOSE)return;
+  if(!catGlancePlans.has(block)) {
+    if(catGlancePlans.size>=3)catGlancePlans.delete(catGlancePlans.keys().next().value);
+    catGlancePlans.set(block,planCatGlance(block));
+  }
+  const event=catGlancePlans.get(block);
+  if(!event||atTime<event.start||atTime>event.start+CAT_GLANCE_SECONDS)return;
+  const {smoothstep,clamp}=THREE.MathUtils;
+  for(const [index,cat] of cats.entries()) {
+    const elapsed=atTime-event.start-(index===event.first?0:.25);
+    const listen=smoothstep(elapsed,0,.24)*(1-smoothstep(elapsed,1.52,1.90));
+    const look=smoothstep(elapsed,.11,.57)*(1-smoothstep(elapsed,1.36,1.88));
+    const peer=cats[1-index];
+    const yaw=catLookAngle(cat.root.position,peer.root.position,cat.root.rotation.y);
+    const direction=Math.sign(yaw);
+    for(const {joint,side} of cat.ears)joint.rotation.y+=direction*listen*(side===-direction?.29:.17);
+    if(look<=0)continue;
+    // Counter the seated torso pitch so the head turns toward the other cat at eye level.
+    glanceHead.setFromAxisAngle(glanceAxis,clamp(yaw,-1.48,1.48));
+    glanceHead.premultiply(glanceBody.copy(cat.bodyPivot.quaternion).invert());
+    cat.head.quaternion.slerp(glanceHead,look);
+    cat.head.position.y+=.017*look;
+    cat.body.rotation.y=.10*look*direction;
+  }
+}
+
+function animateCat(cat,index,atTime) {
+  const {lerp,clamp,smoothstep}=THREE.MathUtils;
+  const motion=foxtailMotionAt(index,atTime)??catMotionAt(index,atTime);
+  const {kind,progress,sitting,x,z,distance,heading,turn=0,hopGaze=0,poseWeight=1}=motion;
+  const stalking=kind==='stalk';
+  const walking=kind==='walk'||stalking;
+  const pouncing=kind==='pounce';
+  const poleJump=kind==='poleJump';
+  const hopping=kind==='jump'||pouncing||poleJump;
+  const flight=hopping?clamp((progress-CAT_HOP.launch)/(CAT_HOP.land-CAT_HOP.launch),0,1):0;
+  const advance=walking?smoothstep(progress,.12,.9):flight;
+  const snowDepth=snowDepthAt(x,z,snowCoverAt(x,z));
+  const hopHeight=(poleJump?foxtailJumpHeight:pouncing?.39:.67)+.09*distance;
+  cat.flight=flight;
+  cat.airHeight=4*hopHeight*flight*(1-flight);
+  cat.root.rotation.y=heading;
   cat.root.position.set(x,0,z);
 
-  const gesture=Math.sin(Math.PI*progress)**2;
-  const peek=beat.kind==='peek'?gesture:0;
-  const sniff=beat.kind==='sniff'?gesture:0;
-  const scan=beat.kind==='scan'?gesture:0;
+  const gesture=Math.sin(Math.PI*progress)**2*poseWeight;
+  const peek=kind==='peek'?gesture:0;
+  const sniff=kind==='sniff'?gesture:0;
+  const scan=kind==='scan'?gesture:0;
 
   const air=Math.sin(Math.PI*flight);
+  const reach=hopping?smoothstep(progress,.34,CAT_HOP.levelStart)*(1-smoothstep(progress,CAT_HOP.levelEnd,.65)):0;
   const landing=hopping?smoothstep(progress,CAT_HOP.land,CAT_HOP.absorb)*(1-smoothstep(progress,.825,.95)):0;
-  const walkWeight=smoothstep(progress,.035,.16)*(1-smoothstep(progress,.87,.99));
+  const walkWeight=walking?poseWeight*smoothstep(progress,.025,.17)*(1-smoothstep(progress,.85,.99)):0;
   const crouch=stalking?walkWeight:0;
-  const strides=Math.max(2,Math.ceil(distance/.33));
+  const strides=Math.max(1,Math.ceil(distance/(stalking?.23:.28)));
   const step=advance*strides;
   const stride=distance/(strides*cat.root.scale.x);
   const strideWave=Math.sin(TAU*step);
+  const walkBob=Math.cos(2*TAU*step);
+  const walkDown=.262+.006*walkBob-.041*crouch;
+  const tailLift=walkWeight-.76*crouch;
   const hopPose=catHopSpline.evaluate(hopping?progress:0);
-  const pitch=(walking?(-.055+.026*strideWave)*walkWeight:catHopPitch(hopping?progress:0))+.10*peek-.13*sniff-.07*crouch;
+  const pitch=(walking?(-.025+.018*strideWave)*walkWeight:catHopPitch(hopping?progress:0))+.10*peek-.13*sniff-.07*crouch+CAT_REST.pitch*sitting;
   cat.bodyPivot.rotation.z=pitch;
-  cat.bodyPivot.rotation.x=walking?.046*walkWeight*strideWave:.035*air*Math.sin(TAU*flight+index);
-  const breath=.013*Math.sin(atTime*3.3+index*1.65);
-  cat.body.scale.set(walking?1+.025*walkWeight*strideWave:hopPose[4],1+breath-.05*sniff-.065*landing,1+breath);
-  const gaze=scan*.68*Math.sin(TAU*progress+index*1.5)+(hopping&&beat.to===1?turn*.31*smoothstep(progress,.47,.70)*(1-smoothstep(progress,.79,1)):0);
-  cat.head.position.set(.295+.049*sniff,.48+.065*peek+.035*scan-.084*sniff,0);
-  cat.head.rotation.set(.07*scan*Math.sin(TAU*progress),gaze,-pitch*.32-.49*sniff+.15*peek+.04*sniff*Math.sin(atTime*17));
+  cat.bodyPivot.rotation.x=walking?.026*walkWeight*strideWave:.035*air*Math.sin(TAU*flight+index);
+  const breath=lerp(.013,.006,sitting)*Math.sin(atTime*3.3+index*1.65);
+  cat.body.scale.set((walking?1+.013*walkWeight*strideWave:hopPose[4])-.20*sitting,1+breath-.05*sniff-.065*landing,1+breath+.055*sitting);
+  cat.body.rotation.y=0;
+  let restGaze=0,tailSide=1;
+  if(sitting>0) {
+    const viewer=-Math.atan2(camera.position.z-z,camera.position.x-x)-cat.root.rotation.y;
+    const side=Math.sin(viewer);
+    restGaze=clamp(Math.atan2(side,Math.cos(viewer)),-.63,.63)*sitting;
+    tailSide=side>0?-1:1;
+  }
+  const gaze=restGaze+scan*.68*Math.sin(TAU*progress+index*1.5)+.12*tailLift*Math.sin(TAU*progress+index)+hopGaze*poseWeight;
+  const headX=.295+.025*reach+.049*sniff+.018*walkWeight+.015*sitting;
+  const headY=.48-.073*reach+.065*peek+.035*scan-.084*sniff+(.019-.007*walkBob)*walkWeight-.043*crouch-.022*sitting;
+  cat.head.position.set(headX,headY,0);
+  cat.head.rotation.set(.07*scan*Math.sin(TAU*progress),gaze,-pitch*(.32+.68*sitting)-.18*reach-.49*sniff+.15*peek+.04*sniff*Math.sin(atTime*17)-.08*crouch);
   for(const {joint,side} of cat.ears) {
-    const flick=Math.max(0,Math.sin(atTime*3.8+side*1.7+index))**10;
-    joint.rotation.set(side*(.15+.12*flick),side*.16+.40*gaze,.04+.12*peek-.10*sniff);
+    const activeFlick=Math.max(0,Math.sin(atTime*3.8+side*1.7+index))**10;
+    const restFlick=.60*Math.max(0,Math.sin(atTime*1.25+side*1.7+index))**24;
+    const flick=lerp(activeFlick,restFlick,sitting);
+    joint.rotation.set(side*(.15+.12*flick),side*.16+.40*gaze,.04+.34*reach+.12*peek-.10*sniff);
   }
   cat.tailBones.forEach((bone,joint)=>{
     const wave=atTime*2.9+index*1.7-joint*.62;
-    bone.rotation.y=Math.sin(wave)*(.09+.036*joint)*(1+.50*scan)+.05*turn*air;
-    bone.rotation.z=(joint===0?(walking?.05*walkWeight:hopPose[5]):.032*Math.sin(wave))-.055*peek+.05*sniff;
+    const yaw=Math.sin(wave)*(.09+.036*joint)*(1+.50*scan)+.05*turn*air;
+    const tailPitch=(joint===0?hopPose[5]:.032*Math.sin(wave))+tailLift*walkTailAngles[joint]-.055*peek+.05*sniff;
+    bone.rotation.y=lerp(yaw,sitTailAngles[joint][0]*tailSide,sitting);
+    const restPitch=sitTailAngles[joint][1]-(joint===0?.24*snowDepth:0);
+    bone.rotation.z=lerp(tailPitch,restPitch,sitting);
   });
   for(const leg of cat.legs) {
-    if(walking)poseWalkingLeg(leg,step,stride,walkWeight,crouch);
-    else poseHopLeg(leg,hopPose,air,pouncing);
     if(leg.front) {
-      leg.pivot.rotation.z+=.22*sniff;
-      leg.ankle.rotation.z-=.36*sniff;
+      leg.pivot.position.x=lerp(foreleg.shoulderX,.142,sitting);
+      leg.pivot.position.y=lerp(catLegY,.29,sitting);
     }
+    if(sitting>0)poseSittingLeg(leg,cat.bodyPivot,sitting);
+    else if(walking)poseWalkingLeg(leg,cat.bodyPivot,step,stride,walkWeight,walkDown,.064-.017*crouch);
+    else poseHopLeg(leg,hopPose,air,pouncing,reach,sniff);
   }
 
-  cat.snowLift=snowCoverAt(x,z)*.065;
+  cat.snowLift=snowDepth*.065;
   cat.contactWeight=.38+.24*landing;
 }
 
@@ -1054,10 +1433,11 @@ function poseAndStampCats(atTime) {
       const force=airborne?0:cat.contactWeight*(1-THREE.MathUtils.smoothstep(height,.018,.075));
       contacts.push({cat:index,paw:pawIndex,x,z,height,force});
       const snow=snowCoverAt(x,z);
-      const snowContact=!airborne&&snow>.55&&height<.043;
+      const depth=snowDepthAt(x,z,snow);
+      const snowContact=!airborne&&snow>.55&&depth>.20&&height<.043;
       if(snowContact&&!leg.snowContact)trampleField.stamp(x,z,headingX,headingZ,.105,.074,.95,true);
       leg.snowContact=snowContact;
-      trampleField.stamp(x,z,headingX,headingZ,.115,.090,force*(1-snow));
+      trampleField.stamp(x,z,headingX,headingZ,.115,.090,force*(1-depth));
     });
   });
   pawContacts=contacts;
@@ -1078,6 +1458,55 @@ function updateTrampling(atTime) {
   }
   poseAndStampCats(atTime);
   trampleField.upload();lastTrampleTime=atTime;
+}
+
+function makeSummerBirds(count) {
+  const traits=new Float32Array([.16,1.02,.69,.88,.33,.96,.88,.91,.43,1.04,.57,.86]);
+  const geometry=new THREE.BufferGeometry();
+  geometry.setAttribute('position',new THREE.BufferAttribute(new Float32Array(count*3),3).setUsage(THREE.DynamicDrawUsage));
+  geometry.setAttribute('aBird',new THREE.BufferAttribute(traits,2));
+  const material=new THREE.ShaderMaterial({
+    uniforms,transparent:true,depthWrite:false,
+    vertexShader:`
+      uniform float uTime; uniform float uPhase; uniform float uPointScale;
+      attribute vec2 aBird;
+      varying float vFlap; varying float vBank; varying float vAlpha;
+      ${seasonGLSL}
+      void main() {
+        float seed=aBird.x;
+        vec2 ground=position.xz;
+        float radius=length(ground);
+        float summer=seasons(ground,uPhase).y;
+        vAlpha=smoothstep(.78,.98,summer)*(1.-smoothstep(5.03,5.31,radius))*(.78+.14*seed);
+        vFlap=sin(uTime*(7.8+1.7*seed)+seed*TAU);
+        vBank=.17*sin(uTime*.76+seed*TAU);
+        vec4 view=modelViewMatrix*vec4(position,1.);
+        gl_Position=projectionMatrix*view;
+        gl_PointSize=19.8*aBird.y*uPointScale*17./-view.z;
+      }`,
+    fragmentShader:`
+      varying float vFlap; varying float vBank; varying float vAlpha;
+      float segmentDistance(vec2 p,vec2 a,vec2 b) {
+        vec2 edge=b-a;
+        return length(p-a-edge*clamp(dot(p-a,edge)/dot(edge,edge),0.,1.));
+      }
+      void main() {
+        vec2 p=gl_PointCoord-.5;
+        p=mat2(cos(vBank),-sin(vBank),sin(vBank),cos(vBank))*p;
+        vec2 center=vec2(0.,.035);
+        vec2 left=vec2(-.17,-.045+.075*vFlap), right=vec2(.15,-.032+.065*vFlap);
+        float inner=min(segmentDistance(p,center,left),segmentDistance(p,center,right));
+        float outer=min(segmentDistance(p,left,vec2(-.40,-.115+.19*vFlap)),
+          segmentDistance(p,right,vec2(.37,-.105+.17*vFlap)));
+        float alpha=vAlpha*max(1.-smoothstep(.027,.081,inner),.83*(1.-smoothstep(.014,.061,outer)));
+        if(alpha<.035)discard;
+        gl_FragColor=vec4(.88,.92,.83,alpha);
+      }`,
+  });
+  const birds=new THREE.Points(geometry,material);
+  birds.frustumCulled=false;
+  scene.add(birds);
+  return birds;
 }
 
 function makeParticles() {
@@ -1102,13 +1531,13 @@ function makeParticles() {
         p.y=.2+sin(age*3.14159)*(.35+aSeed.w*1.45);
         p.x+=sin(age*5.+aSeed.w*17.)*.24+age*.38;
         p.z+=cos(age*4.+aSeed.x*17.)*.26;
-        float enabled=dot(s,vec4(.12,.04,.95,0.));
+        float enabled=dot(s,vec4(.20,.04,1.,0.));
         vAlpha=sin(age*3.14159)*enabled*(.5+aSeed.w*.5)*smoothstep(.8,1.2,r);
-        vColor=mat4x3(vec3(.9,.89,.72),vec3(.75,.78,.47),vec3(.94,.73,.34),vec3(.76,.85,.91))*s;
+        vColor=mat4x3(vec3(.96,.87,.79),vec3(.75,.78,.47),vec3(.95,.74,.35),vec3(.76,.85,.91))*s;
         vSpin=aSeed.z*TAU+uTime*(.3+aSeed.w);
         vec4 view=modelViewMatrix*vec4(p,1.);
         gl_Position=projectionMatrix*view;
-        gl_PointSize=(1.15+aSeed.w*3.8)*uPointScale*16./-view.z;
+        gl_PointSize=(1.15+aSeed.w*3.8)*(1.+.10*s.x+.12*s.z)*uPointScale*16./-view.z;
       }`,
     fragmentShader:`
       varying float vAlpha; varying vec3 vColor; varying float vSpin;
@@ -1136,6 +1565,7 @@ function makeSnowfall() {
       uniform float uTime; uniform float uPhase; uniform float uPointScale;
       attribute vec4 aSeed; varying float vAlpha; varying float vSoftness;
       ${seasonGLSL}
+      ${snowAccumulationGLSL}
       void main() {
         float age=fract(aSeed.z+uTime*(.065+aSeed.w*.055));
         float angle=aSeed.x*TAU, radius=sqrt(aSeed.y)*5.7;
@@ -1143,10 +1573,10 @@ function makeSnowfall() {
         vec3 p=vec3(root.x,.12+(1.-age)*3.5,root.y);
         p.x+=sin(uTime*.55+aSeed.z*TAU)*(.06+aSeed.w*.12)+age*.16;
         p.z+=sin(uTime*.38+aSeed.w*TAU)*.10;
-        float winter=seasons(p.xz,uPhase).w;
+        float winter=softenSnowWrap(seasons(p.xz,uPhase).w,uPhase);
         float bounds=1.-smoothstep(5.25,5.7,length(p.xz));
         float fade=smoothstep(0.,.09,age)*(1.-smoothstep(.90,1.,age));
-        vAlpha=winter*bounds*fade*(.48+aSeed.w*.42);
+        vAlpha=winter*bounds*fade*(.51+aSeed.w*.44);
         vSoftness=aSeed.w;
         vec4 view=modelViewMatrix*vec4(p,1.);
         gl_Position=projectionMatrix*view;
@@ -1203,6 +1633,7 @@ function syncPause() {
 }
 function setPhase(next) {
   phase=((next%4)+4)%4;
+  resetFoxtailPlans();
   uniforms.uPhase.value=phase;
   updateUi(true);
   if(ready)render();
@@ -1215,10 +1646,17 @@ function render() {
   foxtail.pivot.rotation.z=Math.sin(time*.7)*.004;
   foxtail.head.rotation.y=Math.sin(time*1.4)*.025;
   updateTrampling(time);
+  applyCatGlance(time);
   uniforms.uCats.value.set(cats[0].root.position.x,cats[0].root.position.z,cats[1].root.position.x,cats[1].root.position.z);
   uniforms.uCatAir.value.set(cats[0].airHeight,cats[1].airHeight);
   snowCover.visible=snowfall.visible=phase<1||phase>3;
   flowers.visible=phase>0&&phase<3;
+  summerBirds.visible=phase>summerFlight.start&&phase<summerFlight.end;
+  if(summerBirds.visible) {
+    const position=summerBirds.geometry.attributes.position;
+    summerFlight.sample(phase,position.array);
+    position.needsUpdate=true;
+  }
   renderer.render(scene,camera);
 }
 const fract=x=>x-Math.floor(x);
@@ -1230,6 +1668,8 @@ const foxtail=makeFoxtail();
 const cats=[makeCat(false),makeCat(true)];
 makeParticles();
 const snowfall=makeSnowfall();
+const summerFlight=buildSummerFlight(1/phaseRate);
+const summerBirds=makeSummerBirds(summerFlight.count);
 resize(); ready=true; render(); loading.hidden=true;
 syncPause(); updateUi(true);
 new ResizeObserver(resize).observe(stage);
@@ -1239,7 +1679,7 @@ function tick(now) {
   previousTime=now;
   if(!paused&&!document.hidden) {
     time+=dt*speed;
-    phase=(phase+dt*speed*4/SETTINGS.yearSeconds)%4;
+    phase=((needlePhaseOffset+time*phaseRate)%4+4)%4;
     render();
     if(now-lastUiUpdate>120) { updateUi(); lastUiUpdate=now; }
   }
@@ -1281,7 +1721,7 @@ canvas.addEventListener('webglcontextlost',event=>{
 // A small inspection API for deterministic visual checks and future tuning.
 window.seasons={
   setPhase,
-  setTime(value){time=Math.max(0,Number(value)||0);render();},
+  setTime(value){time=Math.max(0,Number(value)||0);resetFoxtailPlans();render();},
   setPaused(value){paused=Boolean(value);syncPause();},
   setTrampling(value){uniforms.uTrampleStrength.value=value?1:0;render();},
   getFootContacts(){return pawContacts.map(contact=>({...contact,compression:trampleField.sample(contact.x,contact.z)}));},
