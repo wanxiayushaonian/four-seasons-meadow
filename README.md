@@ -28,7 +28,7 @@ Worker 名称须与 `wrangler.jsonc` 中的 `name` 一致。该配置会将构�
 
 ## 本地构建与手动部署
 
-在项目根目录运行构建命令。`dist/` 包含站点入口、场景模块、样式和本地 Three.js，开发截图和动图放在 `seasons/artifacts/`。
+在项目根目录运行构建命令。`dist/` 包含站点入口、场景模块、样式和本地 Three.js。开发截图和动图统一存放在本地的 `seasons/artifacts/`。
 
 ```bash
 node scripts/build.mjs

@@ -19,11 +19,6 @@ python3 -m http.server 5173 --bind 127.0.0.1
 
 `scene.js` 中的 `SETTINGS` 控制草高、踩踏和雪印的消退速度、粒子数量及季节循环。`makeGrass` 把短绒与细弯的长叶交错种成小簇，草叶边缘采用多重采样覆盖柔化。`seasonGLSL` 控制季节的角度分布和两侧的渐变带，过渡中的草叶会错开变色。`makeWindMap` 生成风向和强度贴图，`windGLSL` 叠加两种尺度的游移阵风，草叶和花点采样同一个风场。猫爪的接触位置写入 256×256 贴图，草地通道控制草叶和花点的变形，积雪通道控制雪印的凹陷与明暗。`catRoutines` 编排每套动作的顺序、时长和途中停点。同一页面内可以按时间复现动作，刷新会重新打乱组合顺序。跳跃使用三次插值，行走根据爪子目标位置计算关节角，尾巴用四段骨骼驱动连续网格。
 
-## 预览与开发记录
+## 本地预览与开发记录
 
-- [四季画面](artifacts/seasons/) 收录四季截图和色彩对照。
-- [移动端截图](artifacts/mobile/) 收录不同宽度下的画面。
-- [动画片段](artifacts/motion/) 收录猫的动作、风吹草浪和雪景。
-- [开发对照](artifacts/development/) 收录草地、冬景和踩踏效果的调试截图。
-
-这些文件用于记录开发过程，页面运行时无需读取。Three.js 许可证见 [THREE-LICENSE.txt](vendor/THREE-LICENSE.txt)。
+本地生成的四季截图、移动端预览、动图和开发对照集中放在 `artifacts/`。Cloudflare 构建从项目根目录生成 `dist/`，其中收录页面运行所需的文件。Three.js 许可证见 [THREE-LICENSE.txt](vendor/THREE-LICENSE.txt)。
