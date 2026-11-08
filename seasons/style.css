@@ -1,0 +1,70 @@
+:root { color-scheme: dark; font-family: Inter, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif; color: #d3d6d0; background: #080b0c; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input, select { font: inherit; }
+button, select { cursor: pointer; color: inherit; }
+button { border: 0; background: transparent; }
+button:hover { color: #f0dfab; }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid #c0b384; outline-offset: 5px; }
+.experience { width: min(1560px, 100%); margin: auto; padding: 36px 48px 22px; }
+.heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin: 0 0 26px; }
+h1 { margin: 0; font: 400 23px/1.4 "Noto Serif SC", "Songti SC", SimSun, serif; letter-spacing: .3em; color: #e2e0d4; }
+.heading p { margin: 8px 0 0; font: 10px/1.5 Georgia, serif; letter-spacing: .27em; color: #7e857f; }
+.caption { font: 12px/1.8 "Noto Serif SC", "Songti SC", serif; letter-spacing: .18em; color: #8e948b; }
+.stage { position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; background: #05080a; }
+#scene { display: block; width: 100%; height: 100%; }
+.loading { position: absolute; top: 48%; width: 100%; margin: 0; text-align: center; color: #b6b7a6; font-size: 13px; letter-spacing: .13em; }
+.loading[hidden] { display: none; }
+.scene-label { position: absolute; top: 5.7%; left: 4.2%; display: flex; align-items: center; gap: 12px; color: #c1c5b4; pointer-events: none; }
+#season-name { font: 400 15px "Noto Serif SC", "Songti SC", SimSun, serif; letter-spacing: .25em; }
+#season-en { color: #747d77; font: 9px Georgia, serif; letter-spacing: .19em; }
+.scene-rule { width: 24px; height: 1px; background: #626d604d; }
+.icon-button { width: 40px; height: 40px; display: inline-grid; align-items: center; justify-content: center; font-size: 20px; padding: 0; flex: 0 0 auto; }
+.fullscreen { position: absolute; right: 16px; top: 13px; font-size: 24px; color: #929b8b; opacity: .6; }
+.fullscreen:hover { opacity: 1; }
+.controls { max-width: 880px; margin: 24px auto 0; }
+.playback { display: flex; align-items: flex-start; gap: 22px; }
+#play { font-size: 17px; color: #b8c0ae; height: 30px; }
+.timeline-wrap { min-width: 0; flex: 1; padding-top: 6px; }
+input[type="range"] { display: block; width: 100%; height: 18px; margin: 0; accent-color: #b6bf95; cursor: ew-resize; appearance: none; background: transparent; }
+input[type="range"]::-webkit-slider-runnable-track { height: 2px; background: linear-gradient(to right, #b6bf95 var(--progress, 21.75%), #30382f var(--progress, 21.75%)); }
+input[type="range"]::-moz-range-track { height: 2px; background: #30382f; }
+input[type="range"]::-moz-range-progress { height: 2px; background: #b6bf95; }
+input[type="range"]::-webkit-slider-thumb { appearance: none; width: 8px; height: 8px; margin-top: -3px; border-radius: 50%; background: #cbd0b7; }
+input[type="range"]::-moz-range-thumb { width: 8px; height: 8px; border: 0; border-radius: 50%; background: #cbd0b7; }
+.season-marks { display: flex; margin: 4px -12px 0; }
+.season-marks button { width: 25%; text-align: left; padding: 6px 12px; font-size: 11px; color: #707c6c; }
+.season-marks button[aria-pressed="true"] { color: #d6dbbf; }
+#speed { height: 30px; border: 0; background: transparent; color: #9aa28e; font-size: 12px; padding: 0 3px; }
+#speed option { background: #141a15; }
+#save { height: 30px; padding: 0; white-space: nowrap; font-size: 12px; color: #a4ad98; }
+#save span { padding-left: 7px; color: #6e7c65; }
+.footnote { display: flex; justify-content: space-between; gap: 16px; margin: 13px 0 0; color: #687361; font-size: 10px; line-height: 1.8; letter-spacing: .12em; }
+.footnote span { color: #64705f; letter-spacing: .05em; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.stage:fullscreen { width: 100vw; height: 100vh; aspect-ratio: auto; }
+@media (min-width: 1600px) { .experience { padding-top: 46px; } }
+@media (max-width: 700px) {
+  .experience { padding: 25px 16px 20px; }
+  .heading { margin-bottom: 21px; gap: 12px; }
+  h1 { font-size: 20px; }
+  .caption { font-size: 10px; letter-spacing: .08em; }
+  .heading p { font-size: 9px; }
+  .stage { aspect-ratio: 4 / 3; }
+  .scene-label { top: 6%; left: 5%; gap: 8px; }
+  #season-name { font-size: 12px; }
+  #season-en { font-size: 8px; }
+  .scene-rule { width: 16px; }
+  .fullscreen { right: 4px; top: 4px; }
+  .controls { margin-top: 18px; }
+  .playback { gap: 11px; }
+  #play { width: 30px; }
+  #save { font-size: 11px; }
+  #save span { padding-left: 1px; }
+  .footnote { font-size: 9px; letter-spacing: .04em; flex-wrap: wrap; gap: 4px; }
+}
+@media (pointer: coarse) {
+  .season-marks button { min-height: 44px; }
+  #play, #speed, #save { min-height: 44px; }
+  .timeline-wrap { padding-top: 12px; }
+}

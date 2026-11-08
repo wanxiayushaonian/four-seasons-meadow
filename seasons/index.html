@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#080b0c">
+  <meta name="description" content="星空中的一张四季唱片。一穗金色狗尾巴草，和始终相伴的黑白双猫。">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+  <title>四季轮转 · A Little Eternity</title>
+</head>
+<body>
+  <main class="experience">
+    <header class="heading">
+      <div><h1>四季轮转</h1><p>A LITTLE ETERNITY</p></div>
+      <span class="caption">一穗草，两只猫，四季。</span>
+    </header>
+    <section class="stage" aria-label="四季轮转动画">
+      <canvas id="scene" role="img" aria-label="星空中的圆盘上，狗尾巴草绕圆心转动，草地经历春夏秋冬。黑白两只猫在草丛里探头、踱步或跳跃，冬季落爪时会留下雪印。"></canvas>
+      <p class="loading" role="status">等一阵风，等一个春天…</p>
+      <div class="scene-label" aria-hidden="true"><span id="season-name">春生</span><span class="scene-rule"></span><span id="season-en">SPRING</span></div>
+      <button class="fullscreen icon-button" type="button" aria-label="全屏观看" title="全屏观看">⛶</button>
+    </section>
+    <footer class="controls">
+      <div class="playback">
+        <button id="play" class="icon-button" type="button" aria-label="暂停动画" aria-pressed="false"><span aria-hidden="true">Ⅱ</span></button>
+        <div class="timeline-wrap">
+          <label class="sr-only" for="timeline">四季轮转进度</label>
+          <input id="timeline" type="range" min="0" max="3999" step="1" value="870" aria-valuetext="春季">
+          <div class="season-marks" aria-label="跳转到季节">
+            <button type="button" data-season="0" aria-pressed="true">春</button>
+            <button type="button" data-season="1" aria-pressed="false">夏</button>
+            <button type="button" data-season="2" aria-pressed="false">秋</button>
+            <button type="button" data-season="3" aria-pressed="false">冬</button>
+          </div>
+        </div>
+        <label class="sr-only" for="speed">播放速度</label>
+        <select id="speed" aria-label="播放速度"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select>
+        <button id="save" type="button">保存此刻 <span aria-hidden="true">↗</span></button>
+      </div>
+      <p class="footnote">春生 · 夏长 · 秋收 · 冬藏<span>拖动进度，停在喜欢的季节</span></p>
+    </footer>
+    <p id="status" class="sr-only" role="status" aria-live="polite"></p>
+    <noscript>请启用 JavaScript，以观看四季动画。</noscript>
+  </main>
+  <script type="module" src="scene.js"></script>
+</body>
+</html>
