@@ -20,6 +20,7 @@ const SETTINGS = {
 };
 const TAU = Math.PI * 2;
 const phaseRate=4/SETTINGS.yearSeconds;
+const MAX_FRAME_SECONDS=.065;
 const stage = document.querySelector('.stage');
 const canvas = document.querySelector('#scene');
 const loading = document.querySelector('.loading');
@@ -32,6 +33,8 @@ const seasonEnglish = ['SPRING', 'SUMMER', 'AUTUMN', 'WINTER'];
 const seasonButtons = [...document.querySelectorAll('[data-season]')];
 let phase = SETTINGS.initialPhase, time = 0, speed = 1;
 let needlePhaseOffset=phase;
+let requestedSpeed=1, catTimeOffset=0, timelapse=null;
+let firstFoxtailPlan=-Infinity;
 let paused = motionPreference.matches, ready = false, previousTime = 0;
 let lastSeason = -1, lastUiUpdate = 0;
 let randomState = SETTINGS.seed;
@@ -130,10 +133,164 @@ renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 1.75));
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
+renderer.info.autoReset = false;
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(27.5, 16 / 9, .1, 110);
 camera.position.set(0, 9.5, 14.8);
 camera.lookAt(0, .10, 0);
+
+function makeAtmospherePass() {
+  const screen = new THREE.Scene();
+  const screenCamera = new THREE.Camera();
+  const uniforms = {
+    uFrame: { value: null },
+    uCatMask: { value: null },
+    uCatBloom: { value: null },
+    uPixel: { value: new THREE.Vector2() },
+    uAspect: { value: 1 },
+  };
+  const material = new THREE.ShaderMaterial({
+    uniforms, depthTest: false, depthWrite: false, toneMapped: false,
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv=uv;
+        gl_Position=vec4(position.xy,0.,1.);
+      }`,
+    fragmentShader: `
+      uniform sampler2D uFrame;
+      uniform sampler2D uCatMask;
+      uniform sampler2D uCatBloom;
+      uniform vec2 uPixel;
+      uniform float uAspect;
+      varying vec2 vUv;
+      const vec3 luma=vec3(.2126,.7152,.0722);
+
+      vec3 haloSource(vec2 uv) {
+        vec3 color=texture2D(uFrame,uv).rgb;
+        float glow=smoothstep(.47,.86,dot(color,luma));
+        float gold=smoothstep(.08,.29,color.r-color.b);
+        return color*glow*mix(.12,1.,gold);
+      }
+
+      void main() {
+        // The framebuffer already contains display-space colors.
+        vec3 color=texture2D(uFrame,vUv).rgb;
+        float light=dot(color,luma);
+        float shadow=1.-smoothstep(.08,.46,light);
+        float highlight=smoothstep(.28,.78,light);
+        float warmth=smoothstep(.035,.19,color.r-color.b)*highlight;
+        color=mix(color,vec3(light),.075*(1.-highlight));
+        color+=vec3(-.009,.004,.014)*shadow*smoothstep(0.,.085,light);
+        color*=mix(vec3(1.),vec3(1.035,1.012,.975),warmth);
+
+        vec2 spread=uPixel*max(3.,.0065/uPixel.x);
+        vec3 glow=haloSource(vUv+spread)+haloSource(vUv-spread)
+          +haloSource(vUv+vec2(spread.x,-spread.y))+haloSource(vUv+vec2(-spread.x,spread.y));
+        color+=glow*.042;
+
+        vec2 mask=texture2D(uCatMask,vUv).rg;
+        vec2 bloom=texture2D(uCatBloom,vUv).rg;
+        vec2 halo=(1.-exp(-2.4*bloom))*(1.-mask);
+        vec3 aura=halo.r*vec3(.53,.73,1.)+halo.g*vec3(1.,.85,.59);
+        color+=aura*(1.-color)*1.18;
+        color=mix(color,vec3(.71,.84,1.),halo.r*.12);
+        color=mix(color,vec3(1.,.93,.77),halo.g*.16);
+
+        vec2 edge=(vUv-vec2(.5,.42))*vec2(min(uAspect,1.8)*.68,1.);
+        color*=1.-.24*smoothstep(.29,.71,length(edge));
+        vec2 pixel=floor(gl_FragCoord.xy);
+        float grain=fract(52.9829189*fract(dot(pixel,vec2(.06711056,.00583715))))-.5;
+        color+=grain*.011*smoothstep(.015,.17,light)*(1.-.72*highlight);
+        gl_FragColor=vec4(clamp(color,0.,1.),1.);
+      }`,
+  });
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2,2),material);
+  quad.frustumCulled=false;
+  screen.add(quad);
+  const horizontal=new THREE.WebGLRenderTarget(1,1,{depthBuffer:false});
+  const vertical=new THREE.WebGLRenderTarget(1,1,{depthBuffer:false});
+  uniforms.uCatBloom.value=vertical.texture;
+  const blur=new THREE.ShaderMaterial({
+    uniforms:{uSource:{value:null},uStep:{value:new THREE.Vector2()}},
+    vertexShader:material.vertexShader,depthTest:false,depthWrite:false,toneMapped:false,
+    fragmentShader:`
+      uniform sampler2D uSource;
+      uniform vec2 uStep;
+      varying vec2 vUv;
+      void main() {
+        // Adjacent Gaussian taps are paired with bilinear filtering.
+        vec4 color=texture2D(uSource,vUv)*.150733;
+        color+=(texture2D(uSource,vUv+uStep*1.446802)+texture2D(uSource,vUv-uStep*1.446802))*.253750;
+        color+=(texture2D(uSource,vUv+uStep*3.377917)+texture2D(uSource,vUv-uStep*3.377917))*.127663;
+        color+=(texture2D(uSource,vUv+uStep*5.313631)+texture2D(uSource,vUv-uStep*5.313631))*.037035;
+        color+=(texture2D(uSource,vUv+uStep*7.255784)+texture2D(uSource,vUv-uStep*7.255784))*.006185;
+        gl_FragColor=color;
+      }`,
+  });
+  const maskMaterials=[
+    new THREE.MeshBasicMaterial({color:0xff0000,toneMapped:false,depthWrite:false}),
+    new THREE.MeshBasicMaterial({color:0x00ff00,toneMapped:false,depthWrite:false}),
+  ];
+  const catMeshes=[];
+
+  return {
+    resize(width,height) {
+      if(!width||!height)return;
+      const frame=uniforms.uFrame.value;
+      if(frame?.image.width===width&&frame.image.height===height)return;
+      frame?.dispose();
+      uniforms.uFrame.value=new THREE.FramebufferTexture(width,height);
+      uniforms.uCatMask.value?.dispose();
+      uniforms.uCatMask.value=new THREE.FramebufferTexture(width,height);
+      uniforms.uCatMask.value.minFilter=uniforms.uCatMask.value.magFilter=THREE.LinearFilter;
+      const scale=Math.min(.5,640/width);
+      horizontal.setSize(Math.ceil(width*scale),Math.ceil(height*scale));
+      vertical.setSize(horizontal.width,horizontal.height);
+      uniforms.uPixel.value.set(1/width,1/height);
+      uniforms.uAspect.value=width/height;
+    },
+    addCat(root,index) {
+      root.traverse(object=>{
+        if(!object.isMesh||!object.visible||object.material.transparent)return;
+        object.layers.enable(1);
+        catMeshes.push({object,material:object.material,mask:maskMaterials[index]});
+      });
+    },
+    render() {
+      if(!uniforms.uFrame.value)return;
+      renderer.copyFramebufferToTexture(uniforms.uFrame.value);
+      // Reuse the scene depth so grass, snow and the pointer occlude the mask.
+      const background=scene.background;
+      const cameraLayers=camera.layers.mask;
+      scene.background=null;
+      camera.layers.set(1);
+      renderer.autoClear=false;
+      renderer.clearColor();
+      for(const entry of catMeshes)entry.object.material=entry.mask;
+      renderer.render(scene,camera);
+      for(const entry of catMeshes)entry.object.material=entry.material;
+      renderer.autoClear=true;
+      camera.layers.mask=cameraLayers;
+      scene.background=background;
+      renderer.copyFramebufferToTexture(uniforms.uCatMask.value);
+
+      quad.material=blur;
+      blur.uniforms.uSource.value=uniforms.uCatMask.value;
+      blur.uniforms.uStep.value.set(1/horizontal.width,0);
+      renderer.setRenderTarget(horizontal);
+      renderer.render(screen,screenCamera);
+      blur.uniforms.uSource.value=horizontal.texture;
+      blur.uniforms.uStep.value.set(0,1/horizontal.height);
+      renderer.setRenderTarget(vertical);
+      renderer.render(screen,screenCamera);
+      renderer.setRenderTarget(null);
+      quad.material=material;
+      renderer.render(screen,screenCamera);
+    },
+  };
+}
+const atmosphere=makeAtmospherePass();
 
 function makeWindMap() {
   const size=128;
@@ -182,6 +339,7 @@ const uniforms = {
   uPixelRatio: { value: renderer.getPixelRatio() },
   uPointScale: { value: 1 },
   uNeedleDirection: { value: new THREE.Vector2(1,0) },
+  uStemBend: { value: 0 },
   uCats: { value: new THREE.Vector4(.3, 2.8, -.4, 3) },
   uCatAir: { value: new THREE.Vector2() },
   uGrassHeight: { value: SETTINGS.grassHeight },
@@ -224,11 +382,34 @@ const seasonGLSL = `
   float hash(vec2 p) { return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
 `;
 
+const stemBendGLSL = `
+  uniform float uStemBend;
+  float stemOffset(float x) {
+    float distance=clamp(x/5.65,0.,1.);
+    return uStemBend*distance*distance;
+  }
+`;
+
+const foxtailLightGLSL = `
+  uniform vec2 uNeedleDirection;
+  ${stemBendGLSL}
+  float foxtailGlow(vec2 p) {
+    vec2 tangent=vec2(-uNeedleDirection.y,uNeedleDirection.x);
+    float along=dot(p,uNeedleDirection);
+    float across=dot(p,tangent)-stemOffset(along);
+    vec2 offset=vec2((along-4.87)/.86,across/.52);
+    float falloff=max(0.,1.-dot(offset,offset)*.24);
+    float stalk=(1.-smoothstep(.02,.32,abs(across)))
+      *smoothstep(.95,1.6,along)*(1.-smoothstep(4.4,5.25,along));
+    return falloff*falloff*falloff*falloff+.46*stalk;
+  }
+`;
+
 // Grass and flowers sample the same drifting gusts. Individual blades retain a little tip flutter.
 const windGLSL = `
   uniform float uGrassHeight;
   uniform sampler2D uWindMap;
-  uniform vec2 uNeedleDirection;
+  ${foxtailLightGLSL}
   float meadowHeight(vec2 p, vec4 season) {
     float foreground = smoothstep(1.05,2.45,p.y);
     float field = dot(season,vec4(1.12,1.40,1.30,.5));
@@ -255,6 +436,14 @@ const windGLSL = `
     float recovery=1.-smoothstep(.10,mix(.77,1.16,wind.z),lag/lengthOfWake);
     float strength=arrival*recovery*smoothstep(.96,1.75,along)*(.68+.32*wind.z);
     return vec3(tangent*2.10+wind.xy*.20,strength);
+  }
+  float autumnRipple(float behind, float along, float gust, float time) {
+    if(along<.96||behind<0.||behind>2.85)return 0.;
+    // Bend successive bands of grass behind the sweep with a broken, curved front.
+    float curvedFront=behind+.12*sin(along*1.9-time*.38)+.25*(gust-.5);
+    float crest=sin(curvedFront*9.4-time*1.7);
+    float envelope=smoothstep(.04,.36,behind)*(1.-smoothstep(1.40,2.85,behind));
+    return crest*envelope*smoothstep(.96,1.85,along)*(.65+.35*gust);
   }
 `;
 
@@ -358,9 +547,10 @@ function makeSky() {
     c.fillStyle = `rgba(199,210,221,${brightness})`;
     c.beginPath(); c.arc(x, y, size, 0, TAU); c.fill();
     if (size > 1.5) {
-      const g = c.createRadialGradient(x, y, 0, x, y, size * 5);
-      g.addColorStop(0, 'rgba(185,208,236,.13)'); g.addColorStop(1, 'rgba(185,208,236,0)');
-      c.fillStyle = g; c.fillRect(x-size*5, y-size*5, size*10, size*10);
+      const glowRadius = size * 6.5;
+      const g = c.createRadialGradient(x, y, 0, x, y, glowRadius);
+      g.addColorStop(0, 'rgba(185,208,236,.19)'); g.addColorStop(1, 'rgba(185,208,236,0)');
+      c.fillStyle = g; c.fillRect(x-glowRadius, y-glowRadius, glowRadius*2, glowRadius*2);
     }
   }
   const texture = new THREE.CanvasTexture(sky);
@@ -379,12 +569,14 @@ function makeDisc() {
     fragmentShader: `
       uniform float uPhase; varying vec2 vPosition;
       ${seasonGLSL}
+      ${foxtailLightGLSL}
       void main() {
         vec4 s = seasons(vPosition,uPhase);
         float r = length(vPosition);
         vec3 color = mat4x3(vec3(.086,.14,.043),vec3(.068,.129,.028),vec3(.274,.186,.072),vec3(.22,.21,.17)) * s;
         float grooves = .74 + .26 * smoothstep(-.8,.8,sin(r*173.));
         color *= mix(.85,grooves,s.w) * (.78 + .22*hash(floor(vPosition*165.)));
+        color += vec3(.22,.114,.025)*foxtailGlow(vPosition);
         gl_FragColor = vec4(color,1.);
       }`,
   }));
@@ -456,6 +648,7 @@ function makeSnowCover() {
       ${snowGLSL}
       ${catShadowGLSL}
       ${trampleGLSL}
+      ${foxtailLightGLSL}
       void main() {
         vec2 p=vWorld.xz;
         float pixelSpan=max(length(dFdx(p)),length(dFdy(p)));
@@ -493,6 +686,7 @@ function makeSnowCover() {
         color*=catShade(vWorld.xz,vec2(.9,1.5),9.,.20);
         color*=mix(.90,1.,smoothstep(.18,.80,cover));
         color*=mix(.91,1.,vMaturity);
+        color+=vec3(.077,.038,.008)*foxtailGlow(p);
         gl_FragColor=vec4(color,opacity);
       }`,
   });
@@ -577,7 +771,7 @@ function makeGrass() {
     vertexShader: `
       uniform float uTime; uniform float uPhase;
       attribute vec4 aRoot; attribute vec4 aTraits;
-      varying float vHeight; varying vec3 vShade; varying float vNoise; varying float vPressure; varying vec4 vSeason;
+      varying float vHeight; varying vec4 vShade; varying float vNoise; varying float vPressure; varying vec4 vSeason;
       varying float vAcross;
       ${seasonGLSL}
       ${snowAccumulationGLSL}
@@ -597,10 +791,17 @@ function makeGrass() {
         vec2 sideways = normalize(aTraits.yz);
         vec3 wind=meadowWind(root,uTime);
         vec3 wake=needleWake(root,wind);
+        float along=dot(root,uNeedleDirection);
+        float crossDistance=root.x*uNeedleDirection.y-root.y*uNeedleDirection.x;
+        float ripple=0.;
+        if(uPhase>=2.&&uPhase<3.&&s.z>0.) {
+          ripple=s.z*autumnRipple(crossDistance,along,wind.z,uTime);
+        }
         vec2 flow=mix(wind.xy,wake.xy,wake.z)+vec2(-root.y,root.x)*.018*s.z;
+        flow+=vec2(-uNeedleDirection.y,uNeedleDirection.x)*(.72*ripple);
         float flowLength=length(flow);
         vec2 direction=flow/max(flowLength,.001);
-        float bendAngle=clamp((.14+flowLength*1.24)*(.83+aTraits.w*.33),.08,1.45+.72*wake.z);
+        float bendAngle=clamp((.14+flowLength*1.24)*(.83+aTraits.w*.33),.08,1.45+.72*wake.z+.48*abs(ripple));
         bendAngle*=1.-s.w*mix(.83,.50,wake.z);
         float theta=bendAngle*t;
         vec2 curl=vec2(-sideways.y,sideways.x)*(.13+.20*aTraits.w);
@@ -629,18 +830,18 @@ function makeGrass() {
         vSeason.w*=1.-exposed;
         vHeight=t; vNoise=aTraits.w; vPressure=pressure; vAcross=sign(position.x);
         vShade.x=(.82+.14*abs(dot(bladeNormal,normalize(vec3(-.5,.85,.4)))))*(.92+.13*wind.z)*shadow*(1.-pressure*.16);
-        float along=dot(root,uNeedleDirection);
-        float crossDistance=root.x*uNeedleDirection.y-root.y*uNeedleDirection.x;
         vShade.y=1.-.15*exp(-crossDistance*crossDistance*100.)*step(.9,along)*step(along,5.);
         // Bent tips catch a little warm light in the wake, varying with their angle and the gusts.
         vec3 sweepLight=vec3(-.91*uNeedleDirection.y,.414,.91*uNeedleDirection.x);
         float sheen=.49+.51*abs(dot(bladeNormal,sweepLight));
         vShade.z=smoothstep(.14,.81,wake.z)*smoothstep(-.025,.18,crossDistance)
           *sheen*(.75+.25*wind.z)*(.67+.33*aTraits.w)*(1.-s.w);
+        vShade.z+=.38*ripple*(1.-pressure);
+        vShade.w=foxtailGlow(world.xz);
         gl_Position = projectionMatrix*modelViewMatrix*vec4(world,1.);
       }`,
     fragmentShader: `
-      varying float vHeight; varying vec3 vShade; varying float vNoise; varying float vPressure; varying vec4 vSeason;
+      varying float vHeight; varying vec4 vShade; varying float vNoise; varying float vPressure; varying vec4 vSeason;
       varying float vAcross;
       void main() {
         vec3 root = mat4x3(vec3(.075,.148,.049),vec3(.077,.151,.058),vec3(.40,.274,.117),vec3(.55,.63,.66))*vSeason;
@@ -651,6 +852,7 @@ function makeGrass() {
         color += vec3(.23,.122,.024)*vShade.z*smoothstep(.25,.94,vHeight);
         color*=vShade.y;
         color*=1.-vPressure*.30*(1.-vHeight*.25);
+        color+=vec3(.34,.19,.046)*vShade.w*(.36+.64*vHeight);
         float coverage=1.-.32*smoothstep(.58,1.,abs(vAcross));
         gl_FragColor=vec4(color,coverage);
       }`,
@@ -725,7 +927,16 @@ function makeFoxtail() {
     new THREE.Vector3(.15,.008,0),new THREE.Vector3(1.6,.055,.015),
     new THREE.Vector3(3.3,.11,.025),new THREE.Vector3(4.85,.26,.012),new THREE.Vector3(5.65,.37,0),
   ]);
-  const stem = new THREE.Mesh(new THREE.TubeGeometry(curve,64,.012,5,false),new THREE.MeshStandardMaterial({color:'#d2c080',roughness:.6,metalness:.2,emissive:'#7c6a2b',emissiveIntensity:.18}));
+  const stemMaterial=new THREE.MeshStandardMaterial({
+    color:'#dfca88',roughness:.6,metalness:.2,emissive:'#dfb55a',emissiveIntensity:.72,
+  });
+  stemMaterial.onBeforeCompile=shader=>{
+    shader.uniforms.uStemBend=uniforms.uStemBend;
+    shader.vertexShader=stemBendGLSL+shader.vertexShader.replace('#include <begin_vertex>',
+      '#include <begin_vertex>\ntransformed.z+=stemOffset(position.x);');
+  };
+  const stem = new THREE.Mesh(new THREE.TubeGeometry(curve,64,.015,5,false),stemMaterial);
+  stem.frustumCulled=false;
   pivot.add(stem);
   const head = new THREE.Group(); head.position.set(4.62,.224,.017); head.rotation.z=.135;
   pivot.add(head);
@@ -828,13 +1039,17 @@ function makeCat(white) {
     color:white?'#e4e2cb':'#0c1119',roughness:.95,metalness:0,
     emissive:white?'#9a907c':'#171d27',emissiveIntensity:white?.09:.12,
   });
-  if(!white)fur.onBeforeCompile=shader=>{
+  const rimGlow=white?new THREE.Color('#ffe0a6').multiplyScalar(.10)
+    :new THREE.Color('#80baff').multiplyScalar(.25);
+  fur.onBeforeCompile=shader=>{
+    shader.uniforms.uFurGlow={value:rimGlow};
+    shader.fragmentShader='uniform vec3 uFurGlow;\n'+shader.fragmentShader;
     shader.fragmentShader=shader.fragmentShader.replace('#include <emissivemap_fragment>',`
       #include <emissivemap_fragment>
       vec3 rimDirection=normalize((viewMatrix*vec4(.40,.67,-.63,0.)).xyz);
       float edge=1.-clamp(dot(normal,normalize(vViewPosition)),0.,1.);
-      float rim=smoothstep(.17,.84,edge)*smoothstep(.06,.74,dot(normal,rimDirection));
-      totalEmissiveRadiance+=vec3(.016,.032,.055)*rim;
+      float rim=smoothstep(.25,.95,edge)*smoothstep(.10,.75,dot(normal,rimDirection));
+      totalEmissiveRadiance+=uFurGlow*rim;
     `);
   };
   const inner=new THREE.MeshStandardMaterial({color:white?'#bd9e94':'#46404b',roughness:1});
@@ -1026,12 +1241,13 @@ function poseForeleg(leg,x,down,wristPitch,toePitch) {
   leg.paw.rotation.z=toePitch-wristPitch;
 }
 
-function poseHopLeg(leg,pose,air,pouncing,reach=0,sniff=0) {
+function poseHopLeg(leg,pose,air,pouncing,reach=0,sniff=0,extension=1) {
   const {lerp}=THREE.MathUtils;
   const joint=leg.front?0:2;
   const offset=leg.front?.065:.095;
-  const shoulder=pose[joint]+leg.side*offset*air+(pouncing?(leg.front?.055:-.08)*air:0);
-  const bend=pose[joint+1]-leg.side*(leg.front?.06:.11)*air;
+  const idle=leg.front?catIdlePose.front:catIdlePose.hind;
+  const shoulder=lerp(idle[0],pose[joint],extension)+leg.side*offset*air+(pouncing?(leg.front?.055:-.08)*air:0);
+  const bend=lerp(idle[1],pose[joint+1],extension)-leg.side*(leg.front?.06:.11)*air;
   if(leg.front) {
     const paw=authoredForePaw(shoulder+.22*sniff,bend-.36*sniff);
     poseForeleg(leg,paw.x,paw.down,lerp(paw.pitch+rearPawAngle,1.05,reach),lerp(paw.pitch,-.12,reach));
@@ -1237,7 +1453,7 @@ const CAT_GLANCE_BLOCK=CAT_CYCLE_SECONDS*2;
 const CAT_GLANCE_SECONDS=2.15;
 const CAT_GLANCE_OPEN=5.8;
 const CAT_GLANCE_CLOSE=CAT_GLANCE_BLOCK-1.55;
-const needleAngleAt=atTime=>fract(needlePhaseOffset+atTime*phaseRate)*TAU;
+const needleAngleAt=atTime=>fract(needlePhaseOffset+(atTime+catTimeOffset)*phaseRate)*TAU;
 
 function resetFoxtailPlans() {
   needlePhaseOffset=phase-time*phaseRate;
@@ -1258,7 +1474,7 @@ function foxtailMotionAt(index,atTime) {
       if(cache.size>=5)cache.delete(cache.keys().next().value);
       cache.set(cycle,plans);
     }
-    const plan=cache.get(cycle).find(item=>atTime>=item.start&&atTime<item.end);
+    const plan=cache.get(cycle).find(item=>item.start>=firstFoxtailPlan&&atTime>=item.start&&atTime<item.end);
     if(plan)return foxtailJumpAction(plan,atTime,CAT_HOP);
   }
   return null;
@@ -1329,20 +1545,153 @@ function applyCatGlance(atTime) {
   }
 }
 
-function animateCat(cat,index,atTime) {
+const TIMELAPSE_SPEED=4;
+const TIMELAPSE_INTERVAL=14;
+
+function normalCatMotion(index,atTime) {
+  return foxtailMotionAt(index,atTime)??catMotionAt(index,atTime);
+}
+
+function idleMotion(point,sitting,heading=point.heading) {
+  return {...point,kind:'idle',progress:0,distance:0,sitting,heading,hopGaze:0,turn:0};
+}
+
+// A change of resting spot uses the existing paw targets and walking rig.
+function walkBetween(from,to,elapsed,duration) {
+  const {lerp,smoothstep,clamp}=THREE.MathUtils;
+  const dx=to.x-from.x,dz=to.z-from.z;
+  const distance=Math.hypot(dx,dz);
+  const heading=distance>.005?-Math.atan2(dz,dx):from.heading;
+  if(elapsed<.70) {
+    const rise=smoothstep(elapsed,0,.70);
+    const turn=Math.atan2(Math.sin(heading-from.heading),Math.cos(heading-from.heading));
+    return idleMotion(from,from.sitting*(1-rise),from.heading+turn*rise);
+  }
+  const progress=clamp((elapsed-.70)/duration,0,1);
+  const advance=smoothstep(progress,.12,.9);
+  if(progress<1) {
+    return {kind:'walk',progress,distance,sitting:0,heading,x:lerp(from.x,to.x,advance),z:lerp(from.z,to.z,advance)};
+  }
+  const settle=smoothstep(elapsed,.70+duration,1.50+duration);
+  const turn=Math.atan2(Math.sin(to.heading-heading),Math.cos(to.heading-heading));
+  return idleMotion(to,to.sitting*settle,heading+turn*settle);
+}
+
+function calmCatMotion(index,elapsed) {
+  const {entry,spots}=timelapse.cats[index];
+  const sinceMove=elapsed-(index===0?4.2:10.8);
+  if(sinceMove<0) {
+    const settle=THREE.MathUtils.smoothstep(elapsed,.12,.96);
+    return idleMotion(entry,THREE.MathUtils.lerp(entry.sitting,1,settle));
+  }
+  const move=Math.floor(sinceMove/TIMELAPSE_INTERVAL);
+  return walkBetween(spots[move%2],spots[(move+1)%2],sinceMove%TIMELAPSE_INTERVAL,1.32);
+}
+
+function catAnimationTime(sceneTime) {
+  if(!timelapse||sceneTime<timelapse.start)return sceneTime-catTimeOffset;
+  const {start,normalTime,exit}=timelapse;
+  if(exit&&sceneTime>=exit.start) {
+    return normalTime+(exit.start-start)/TIMELAPSE_SPEED+(sceneTime-exit.start)/exit.speed;
+  }
+  return normalTime+(sceneTime-start)/TIMELAPSE_SPEED;
+}
+
+function activeCatMotion(index,sceneTime) {
+  if(!timelapse||sceneTime<timelapse.start)return normalCatMotion(index,sceneTime-catTimeOffset);
+  const {start,exit}=timelapse;
+  if(exit&&sceneTime>=exit.start) {
+    const cat=exit.cats[index];
+    return walkBetween(cat.from,cat.to,(sceneTime-exit.start)/exit.speed,exit.duration);
+  }
+  return calmCatMotion(index,(sceneTime-start)/TIMELAPSE_SPEED);
+}
+
+function snowTravelMotion(motion) {
+  const {kind,progress,distance,heading,x,z,poseWeight=1}=motion;
+  if((kind!=='walk'&&kind!=='stalk')||motion.sitting>0||distance<.025||progress<=0||progress>=1)return motion;
+  const {lerp,smoothstep,clamp}=THREE.MathUtils;
+  const hops=Math.max(2,Math.round(distance/.26));
+  const step=clamp((progress-.12)/(.9-.12),0,1)*hops;
+  const index=Math.min(hops-1,Math.floor(step));
+  const hopProgress=step-index;
+  const advance=smoothstep(progress,.12,.9);
+  const start=smoothstep(.12+(.9-.12)*index/hops,.12,.9);
+  const end=smoothstep(.12+(.9-.12)*(index+1)/hops,.12,.9);
+  const dx=Math.cos(heading)*distance, dz=-Math.sin(heading)*distance;
+  const cover=snowCoverAt(x,z);
+  if(cover<.55)return motion;
+  const depth=snowDepthAt(x,z,cover);
+  const snowHop=poseWeight*smoothstep(cover,.55,.79)*smoothstep(depth,.17,.35);
+  if(snowHop<=0)return motion;
+  const flight=clamp((hopProgress-CAT_HOP.launch)/(CAT_HOP.land-CAT_HOP.launch),0,1);
+  const offset=lerp(start,end,flight)-advance;
+  return {...motion,x:x+dx*offset*snowHop,z:z+dz*offset*snowHop,snowHop,hopProgress};
+}
+
+function updatePlaybackMode() {
+  if(timelapse?.exit) {
+    const {exit}=timelapse;
+    if(time<exit.start+(exit.duration+1.50)*exit.speed)return;
+    catTimeOffset=time-exit.resumeAt;
+    firstFoxtailPlan=exit.resumeAt;
+    timelapse=null;
+    resetFoxtailPlans();
+  }
+  if(requestedSpeed===TIMELAPSE_SPEED&&!timelapse) {
+    const normalTime=time-catTimeOffset;
+    const entries=cats.map((_,index)=>snowTravelMotion(normalCatMotion(index,normalTime)));
+    // Finish the current jump, including its landing pose.
+    if(entries.some(m=>{
+      const hopping=m.snowHop>.35||['jump','pounce','poleJump'].includes(m.kind);
+      const progress=m.hopProgress??m.progress;
+      return hopping&&progress>CAT_HOP.launch&&progress<CAT_HOP.hindDown;
+    }))return;
+    timelapse={start:time,normalTime,cats:entries.map((entry,index)=>{
+      const peer=entries[1-index];
+      const heading=-Math.atan2(entry.z-peer.z,entry.x-peer.x);
+      const other={x:entry.x+Math.cos(heading)*.61,z:entry.z-Math.sin(heading)*.61,sitting:1,heading};
+      return {entry,spots:[idleMotion(entry,1),other]};
+    })};
+  } else if(requestedSpeed!==TIMELAPSE_SPEED&&timelapse) {
+    const elapsed=(time-timelapse.start)/TIMELAPSE_SPEED;
+    const from=cats.map((_,index)=>calmCatMotion(index,elapsed));
+    if(from.some(m=>m.sitting<.999))return;
+    let resumeAt=Math.ceil(timelapse.normalTime/CAT_CYCLE_SECONDS)*CAT_CYCLE_SECONDS;
+    let targets=cats.map((_,index)=>catMotionAt(index,resumeAt));
+    // Rejoin the ordinary route at a quiet moment close to the entry positions.
+    for(let delay=0;delay<4;delay+=.10) {
+      const candidate=timelapse.normalTime+delay;
+      const poses=cats.map((_,index)=>catMotionAt(index,candidate));
+      if(poses.every(m=>m.sitting>.999||m.progress===0||m.progress===1)) {
+        resumeAt=candidate;
+        targets=poses;
+        break;
+      }
+    }
+    const distance=Math.max(...targets.map((m,i)=>Math.hypot(m.x-from[i].x,m.z-from[i].z)));
+    timelapse.exit={start:time,resumeAt,speed:requestedSpeed,duration:Math.max(1.05,distance/.75),
+      cats:targets.map((to,i)=>({from:from[i],to}))};
+  }
+  speed=requestedSpeed;
+}
+
+function animateCat(cat,index,sceneTime) {
   const {lerp,clamp,smoothstep}=THREE.MathUtils;
-  const motion=foxtailMotionAt(index,atTime)??catMotionAt(index,atTime);
-  const {kind,progress,sitting,x,z,distance,heading,turn=0,hopGaze=0,poseWeight=1}=motion;
+  const motion=snowTravelMotion(activeCatMotion(index,sceneTime));
+  const atTime=catAnimationTime(sceneTime);
+  const {kind,progress,sitting,x,z,distance,heading,turn=0,hopGaze=0,poseWeight=1,snowHop=0,hopProgress=progress}=motion;
   const stalking=kind==='stalk';
   const walking=kind==='walk'||stalking;
   const pouncing=kind==='pounce';
   const poleJump=kind==='poleJump';
-  const hopping=kind==='jump'||pouncing||poleJump;
-  const flight=hopping?clamp((progress-CAT_HOP.launch)/(CAT_HOP.land-CAT_HOP.launch),0,1):0;
+  const hopping=kind==='jump'||pouncing||poleJump||snowHop>0;
+  const flight=hopping?clamp((hopProgress-CAT_HOP.launch)/(CAT_HOP.land-CAT_HOP.launch),0,1):0;
   const advance=walking?smoothstep(progress,.12,.9):flight;
   const snowDepth=snowDepthAt(x,z,snowCoverAt(x,z));
-  const hopHeight=(poleJump?foxtailJumpHeight:pouncing?.39:.67)+.09*distance;
+  const hopHeight=snowHop>0?.14*snowHop:(poleJump?foxtailJumpHeight:pouncing?.39:.67)+.09*distance;
   cat.flight=flight;
+  cat.snowHop=snowHop;
   cat.airHeight=4*hopHeight*flight*(1-flight);
   cat.root.rotation.y=heading;
   cat.root.position.set(x,0,z);
@@ -1353,8 +1702,8 @@ function animateCat(cat,index,atTime) {
   const scan=kind==='scan'?gesture:0;
 
   const air=Math.sin(Math.PI*flight);
-  const reach=hopping?smoothstep(progress,.34,CAT_HOP.levelStart)*(1-smoothstep(progress,CAT_HOP.levelEnd,.65)):0;
-  const landing=hopping?smoothstep(progress,CAT_HOP.land,CAT_HOP.absorb)*(1-smoothstep(progress,.825,.95)):0;
+  const reach=hopping?smoothstep(hopProgress,.34,CAT_HOP.levelStart)*(1-smoothstep(hopProgress,CAT_HOP.levelEnd,.65))*(1-.55*snowHop):0;
+  const landing=hopping?smoothstep(hopProgress,CAT_HOP.land,CAT_HOP.absorb)*(1-smoothstep(hopProgress,.825,.95)):0;
   const walkWeight=walking?poseWeight*smoothstep(progress,.025,.17)*(1-smoothstep(progress,.85,.99)):0;
   const crouch=stalking?walkWeight:0;
   const strides=Math.max(1,Math.ceil(distance/(stalking?.23:.28)));
@@ -1364,12 +1713,15 @@ function animateCat(cat,index,atTime) {
   const walkBob=Math.cos(2*TAU*step);
   const walkDown=.262+.006*walkBob-.041*crouch;
   const tailLift=walkWeight-.76*crouch;
-  const hopPose=catHopSpline.evaluate(hopping?progress:0);
-  const pitch=(walking?(-.025+.018*strideWave)*walkWeight:catHopPitch(hopping?progress:0))+.10*peek-.13*sniff-.07*crouch+CAT_REST.pitch*sitting;
+  const hopPose=catHopSpline.evaluate(hopping?hopProgress:0);
+  const walkPitch=(-.025+.018*strideWave)*walkWeight;
+  const jumpPitch=catHopPitch(hopping?hopProgress:0);
+  const pitch=(walking?lerp(walkPitch,jumpPitch*.44,snowHop):jumpPitch)+.10*peek-.13*sniff-.07*crouch*(1-snowHop)+CAT_REST.pitch*sitting;
   cat.bodyPivot.rotation.z=pitch;
-  cat.bodyPivot.rotation.x=walking?.026*walkWeight*strideWave:.035*air*Math.sin(TAU*flight+index);
+  cat.bodyPivot.rotation.x=walking?.026*walkWeight*strideWave*(1-snowHop):.035*air*Math.sin(TAU*flight+index);
   const breath=lerp(.013,.006,sitting)*Math.sin(atTime*3.3+index*1.65);
-  cat.body.scale.set((walking?1+.013*walkWeight*strideWave:hopPose[4])-.20*sitting,1+breath-.05*sniff-.065*landing,1+breath+.055*sitting);
+  const stretch=walking?lerp(1+.013*walkWeight*strideWave,lerp(1,hopPose[4],.60),snowHop):hopPose[4];
+  cat.body.scale.set(stretch-.20*sitting,1+breath-.05*sniff-.065*landing,1+breath+.055*sitting);
   cat.body.rotation.y=0;
   let restGaze=0,tailSide=1;
   if(sitting>0) {
@@ -1403,8 +1755,18 @@ function animateCat(cat,index,atTime) {
       leg.pivot.position.y=lerp(catLegY,.29,sitting);
     }
     if(sitting>0)poseSittingLeg(leg,cat.bodyPivot,sitting);
-    else if(walking)poseWalkingLeg(leg,cat.bodyPivot,step,stride,walkWeight,walkDown,.064-.017*crouch);
-    else poseHopLeg(leg,hopPose,air,pouncing,reach,sniff);
+    else if(walking&&snowHop<.999) {
+      poseWalkingLeg(leg,cat.bodyPivot,step,stride,walkWeight,walkDown,.064-.017*crouch);
+      if(snowHop>0) {
+        const hip=leg.pivot.rotation.z,knee=leg.lower.rotation.z,paw=leg.paw.rotation.z;
+        const wrist=leg.wrist?.rotation.z;
+        poseHopLeg(leg,hopPose,air,false,reach,0,.60);
+        leg.pivot.rotation.z=lerp(hip,leg.pivot.rotation.z,snowHop);
+        leg.lower.rotation.z=lerp(knee,leg.lower.rotation.z,snowHop);
+        leg.paw.rotation.z=lerp(paw,leg.paw.rotation.z,snowHop);
+        if(leg.wrist)leg.wrist.rotation.z=lerp(wrist,leg.wrist.rotation.z,snowHop);
+      }
+    } else poseHopLeg(leg,hopPose,air,pouncing,reach,sniff,snowHop>0?.60:1);
   }
 
   cat.snowLift=snowDepth*.065;
@@ -1418,8 +1780,11 @@ function poseAndStampCats(atTime) {
   cats.forEach((cat,index)=>{
     animateCat(cat,index,atTime);
     const airborne=cat.flight>0&&cat.flight<1;
+    const offGround=airborne&&(cat.snowHop===0||cat.snowHop>.35);
     let support=measurePawSupport(cat);
-    if(airborne) {
+    if(cat.snowHop>0) {
+      support+=cat.airHeight;
+    } else if(airborne) {
       // Connect the push-off and touchdown heights with a single arc independent of leg motion.
       const base=THREE.MathUtils.lerp(cat.takeoffSupport,cat.landingSupport,cat.flight);
       support=Math.max(support,base+cat.airHeight);
@@ -1430,11 +1795,11 @@ function poseAndStampCats(atTime) {
     cat.legs.forEach((leg,pawIndex)=>{
       const {x,y,z}=leg.sole;
       const height=y+lift-cat.snowLift;
-      const force=airborne?0:cat.contactWeight*(1-THREE.MathUtils.smoothstep(height,.018,.075));
+      const force=offGround?0:cat.contactWeight*(1-THREE.MathUtils.smoothstep(height,.018,.075));
       contacts.push({cat:index,paw:pawIndex,x,z,height,force});
       const snow=snowCoverAt(x,z);
       const depth=snowDepthAt(x,z,snow);
-      const snowContact=!airborne&&snow>.55&&depth>.20&&height<.043;
+      const snowContact=!offGround&&snow>.55&&depth>.20&&height<.043;
       if(snowContact&&!leg.snowContact)trampleField.stamp(x,z,headingX,headingZ,.105,.074,.95,true);
       leg.snowContact=snowContact;
       trampleField.stamp(x,z,headingX,headingZ,.115,.090,force*(1-depth));
@@ -1444,7 +1809,8 @@ function poseAndStampCats(atTime) {
 }
 function updateTrampling(atTime) {
   const dt=lastTrampleTime===null?Infinity:atTime-lastTrampleTime;
-  if(dt<0||dt>.18) {
+  const seekThreshold=Math.max(.18,MAX_FRAME_SECONDS*speed+.001);
+  if(dt<0||dt>seekThreshold) {
     trampleField.clear();
     for(const cat of cats)for(const leg of cat.legs)leg.snowContact=false;
     // Rebuild only the recent steps when seeking, without rendering the replay.
@@ -1454,7 +1820,13 @@ function updateTrampling(atTime) {
       trampleField.decay(step);poseAndStampCats(t);
     }
   } else {
-    trampleField.decay(dt);
+    // Sample intermediate paw contacts when an accelerated frame spans a long step.
+    const sampleInterval=phase<1||phase>3?1/24:2*MAX_FRAME_SECONDS;
+    const steps=Math.max(1,Math.ceil(dt/sampleInterval));
+    for(let i=1;i<=steps;i++) {
+      trampleField.decay(dt/steps);
+      if(i<steps)poseAndStampCats(lastTrampleTime+dt*i/steps);
+    }
   }
   poseAndStampCats(atTime);
   trampleField.upload();lastTrampleTime=atTime;
@@ -1511,15 +1883,23 @@ function makeSummerBirds(count) {
 
 function makeParticles() {
   const geometry=new THREE.BufferGeometry();
-  const seeds=new Float32Array(SETTINGS.particles*4);
+  const count=SETTINGS.particles+1280;
+  const seeds=new Float32Array(count*4);
+  const autumnOnly=new Float32Array(count);
   for(let i=0;i<SETTINGS.particles;i++)seeds.set([random(),random(),random(),random()],i*4);
-  geometry.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(SETTINGS.particles*3),3));
+  const snowfallSeed=randomState;
+  for(let i=SETTINGS.particles;i<count;i++)seeds.set([random(),random(),random(),random()],i*4);
+  randomState=snowfallSeed;
+  autumnOnly.fill(1,SETTINGS.particles);
+  geometry.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(count*3),3));
   geometry.setAttribute('aSeed',new THREE.BufferAttribute(seeds,4));
+  geometry.setAttribute('aAutumnOnly',new THREE.BufferAttribute(autumnOnly,1));
   const material=new THREE.ShaderMaterial({
     uniforms,transparent:true,depthWrite:false,
     vertexShader:`
       uniform float uTime; uniform float uPhase; uniform float uPointScale;
-      attribute vec4 aSeed; varying float vAlpha; varying vec3 vColor; varying float vSpin;
+      attribute vec4 aSeed; attribute float aAutumnOnly;
+      varying float vAlpha; varying vec3 vColor; varying float vSpin;
       ${seasonGLSL}
       void main() {
         float age=fract(aSeed.z+uTime*(.045+aSeed.w*.036));
@@ -1531,13 +1911,16 @@ function makeParticles() {
         p.y=.2+sin(age*3.14159)*(.35+aSeed.w*1.45);
         p.x+=sin(age*5.+aSeed.w*17.)*.24+age*.38;
         p.z+=cos(age*4.+aSeed.x*17.)*.26;
-        float enabled=dot(s,vec4(.20,.04,1.,0.));
-        vAlpha=sin(age*3.14159)*enabled*(.5+aSeed.w*.5)*smoothstep(.8,1.2,r);
+        p.xz+=vec2(1.8,1.15)*(age-.46)*s.z;
+        p.y=mix(p.y,1.05+aSeed.w*.95-age*.72+.15*sin(age*6.+aSeed.x*TAU),s.z);
+        float enabled=mix(dot(s,vec4(.27,.065,1.,0.)),s.z*.85,aAutumnOnly);
+        float edge=1.-s.z*smoothstep(5.05,5.7,length(p.xz));
+        vAlpha=sin(age*3.14159)*enabled*edge*(.5+aSeed.w*.5)*smoothstep(.8,1.2,r);
         vColor=mat4x3(vec3(.96,.87,.79),vec3(.75,.78,.47),vec3(.95,.74,.35),vec3(.76,.85,.91))*s;
         vSpin=aSeed.z*TAU+uTime*(.3+aSeed.w);
         vec4 view=modelViewMatrix*vec4(p,1.);
         gl_Position=projectionMatrix*view;
-        gl_PointSize=(1.15+aSeed.w*3.8)*(1.+.10*s.x+.12*s.z)*uPointScale*16./-view.z;
+        gl_PointSize=(1.15+aSeed.w*3.8)*(1.08+.14*s.x+.18*s.z)*uPointScale*16./-view.z;
       }`,
     fragmentShader:`
       varying float vAlpha; varying vec3 vColor; varying float vSpin;
@@ -1545,7 +1928,8 @@ function makeParticles() {
         vec2 p=gl_PointCoord-.5;
         p=mat2(cos(vSpin),-sin(vSpin),sin(vSpin),cos(vSpin))*p;
         float d=length(p*vec2(1.,2.2));
-        float a=(1.-smoothstep(.22,.5,d))*vAlpha;
+        float fringe=.20*(1.-smoothstep(.17,.49,length(p)));
+        float a=max(1.-smoothstep(.18,.46,d),fringe)*vAlpha;
         if(a<.025)discard;
         gl_FragColor=vec4(vColor,a);
       }`,
@@ -1576,11 +1960,11 @@ function makeSnowfall() {
         float winter=softenSnowWrap(seasons(p.xz,uPhase).w,uPhase);
         float bounds=1.-smoothstep(5.25,5.7,length(p.xz));
         float fade=smoothstep(0.,.09,age)*(1.-smoothstep(.90,1.,age));
-        vAlpha=winter*bounds*fade*(.51+aSeed.w*.44);
+        vAlpha=winter*bounds*fade*(.56+aSeed.w*.44);
         vSoftness=aSeed.w;
         vec4 view=modelViewMatrix*vec4(p,1.);
         gl_Position=projectionMatrix*view;
-        gl_PointSize=(1.2+pow(aSeed.w,2.)*3.4)*uPointScale*17./-view.z;
+        gl_PointSize=(1.25+pow(aSeed.w,2.)*3.85)*uPointScale*17./-view.z;
       }`,
     fragmentShader:`
       varying float vAlpha; varying float vSoftness;
@@ -1607,6 +1991,7 @@ function resize() {
   const w=stage.clientWidth,h=stage.clientHeight;
   if(!w||!h)return;
   renderer.setSize(w,h,false);
+  atmosphere.resize(canvas.width,canvas.height);
   uniforms.uPointScale.value=renderer.getPixelRatio()*w/1344;
   camera.aspect=w/h;
   // Preserve the whole disc on a narrow display, without stretching the circle.
@@ -1644,9 +2029,12 @@ function render() {
   uniforms.uNeedleDirection.value.set(Math.cos(needle),Math.sin(needle));
   foxtail.pivot.rotation.y=-needle;
   foxtail.pivot.rotation.z=Math.sin(time*.7)*.004;
-  foxtail.head.rotation.y=Math.sin(time*1.4)*.025;
+  const bend=uniforms.uStemBend.value=-.035-.096*speed+Math.sin(time*1.65)*.018;
+  const headAlong=foxtail.head.position.x/5.65;
+  foxtail.head.position.z=.017+bend*headAlong*headAlong;
+  foxtail.head.rotation.y=-Math.atan(2*bend*headAlong/5.65)+Math.sin(time*1.4)*.025;
   updateTrampling(time);
-  applyCatGlance(time);
+  if(!timelapse)applyCatGlance(time-catTimeOffset);
   uniforms.uCats.value.set(cats[0].root.position.x,cats[0].root.position.z,cats[1].root.position.x,cats[1].root.position.z);
   uniforms.uCatAir.value.set(cats[0].airHeight,cats[1].airHeight);
   snowCover.visible=snowfall.visible=phase<1||phase>3;
@@ -1657,7 +2045,9 @@ function render() {
     summerFlight.sample(phase,position.array);
     position.needsUpdate=true;
   }
+  renderer.info.reset();
   renderer.render(scene,camera);
+  atmosphere.render();
 }
 const fract=x=>x-Math.floor(x);
 
@@ -1666,6 +2056,7 @@ const flowers=makeFlowers();
 const snowCover=makeSnowCover();
 const foxtail=makeFoxtail();
 const cats=[makeCat(false),makeCat(true)];
+cats.forEach((cat,index)=>atmosphere.addCat(cat.root,index));
 makeParticles();
 const snowfall=makeSnowfall();
 const summerFlight=buildSummerFlight(1/phaseRate);
@@ -1675,9 +2066,10 @@ syncPause(); updateUi(true);
 new ResizeObserver(resize).observe(stage);
 
 function tick(now) {
-  const dt=previousTime?Math.min((now-previousTime)/1000,.065):0;
+  const dt=previousTime?Math.min((now-previousTime)/1000,MAX_FRAME_SECONDS):0;
   previousTime=now;
   if(!paused&&!document.hidden) {
+    updatePlaybackMode();
     time+=dt*speed;
     phase=((needlePhaseOffset+time*phaseRate)%4+4)%4;
     render();
@@ -1691,7 +2083,11 @@ timeline.addEventListener('input',()=>setPhase(Number(timeline.value)/1000));
 seasonButtons.forEach((button,i)=>button.addEventListener('click',()=>{
   setPhase(i+.86); status.textContent=`已切换至${seasonNames[i]}`;
 }));
-document.querySelector('#speed').addEventListener('change',event=>{speed=Number(event.target.value);});
+document.querySelector('#speed').addEventListener('change',event=>{
+  requestedSpeed=Number(event.target.value);
+  updatePlaybackMode();
+  render();
+});
 canvas.tabIndex=0;
 canvas.addEventListener('keydown',event=>{
   if(event.code==='Space') { event.preventDefault(); paused=!paused; syncPause(); }
@@ -1721,7 +2117,11 @@ canvas.addEventListener('webglcontextlost',event=>{
 // A small inspection API for deterministic visual checks and future tuning.
 window.seasons={
   setPhase,
-  setTime(value){time=Math.max(0,Number(value)||0);resetFoxtailPlans();render();},
+  setTime(value){
+    time=Math.max(0,Number(value)||0);
+    catTimeOffset=0;timelapse=null;firstFoxtailPlan=-Infinity;
+    lastTrampleTime=null;resetFoxtailPlans();updatePlaybackMode();render();
+  },
   setPaused(value){paused=Boolean(value);syncPause();},
   setTrampling(value){uniforms.uTrampleStrength.value=value?1:0;render();},
   getFootContacts(){return pawContacts.map(contact=>({...contact,compression:trampleField.sample(contact.x,contact.z)}));},
